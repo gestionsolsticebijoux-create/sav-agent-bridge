@@ -32,17 +32,18 @@ function jsonError(res, status, message, details) {
 
 // --- LOGIQUE MÉTIER ---
 
+
 async function extractDataFromImage(file) {
     const b64 = file.buffer.toString("base64");
     const dataUrl = `data:${file.mimetype};base64,${b64}`;
 
     const response = await openai.chat.completions.create({
-      model: "gpt-5-nano", // <-- MODIFIÉ SELON TA DEMANDE
+      model: "gpt-4o-mini",
       response_format: { type: "json_object" },
       messages: [
         {
           role: "system",
-          content: "Tu es un extracteur d’informations SAV. Tu retournes toujours du JSON valide."
+          content: "Tu es un extracteur d’informations SAV expert. Tu analyses des preuves visuelles (Email, WhatsApp, SMS)."
         },
         {
           role: "user",
@@ -50,27 +51,26 @@ async function extractDataFromImage(file) {
             {
               type: "text",
               text: [
-                "Tu es un extracteur d’informations SAV. Entrée : une capture d’écran d’un email SAV (image). Objectif : extraire les identifiants visibles (email client, numéro de commande, numéro de suivi) et retourner UNIQUEMENT un JSON valide conforme au schéma ci-dessous.",
-                "Règles :",
-                "N’invente rien. Si une donnée n’est pas lisible avec certitude, mets null.",
-                "L’email est généralement dans l’en-tête (De/From/Reply-to) ou dans la signature. C'est celui en face de la mention 'De', pas celui en face de 'A'",
-                "Le numéro de commande peut apparaître sous forme Commande 70319, Commande #70319, Order 70319, etc.",
-                "Le numéro de suivi (“tracking”) peut ressembler à : Colissimo/La Poste (LE...FR, CC...FR, etc.), DHL, UPS, etc. Si plusieurs candidats, prends le plus probable et ignore les autres (on ne gère pas les alternatives dans ce schéma simplifié).",
-                "Ne retourne aucun texte hors JSON.",
-                "Schéma JSON à respecter :",
+                "CONTEXTE: L'utilisateur envoie une capture d'écran (WhatsApp, SMS, Email) pour retrouver une commande.",
+                "TA MISSION : Scanner l'image ENTIÈRE (y compris les en-têtes/headers d'application) pour trouver des identifiants.",
+                "",
+                "Retourne UNIQUEMENT ce JSON :",
                 "{",
-                '  "customer": { "email": null },',
+                '  "customer": { "email": null, "phone": null },',
                 '  "order": { "order_number": null },',
                 '  "shipment": { "tracking_number": null },',
                 '  "signals": { "best_key": null, "has_enough": false }',
                 "}",
-                "Logique signals.best_key :",
-                "si shipment.tracking_number non-null → 'tracking_number'",
-                "sinon si order.order_number non-null → 'order_number'",
-                "sinon si customer.email non-null → 'email'",
-                "sinon → null",
-                "signals.has_enough = true si signals.best_key n’est pas null, sinon false.",
-                "Sortie : retourne uniquement le JSON."
+                "",
+                "RÈGLES STRICTES :",
+                "1. TÉLÉPHONE (Crucial) :",
+                "   - Regarde attentivement le HAUT de l'image (Barre de titre WhatsApp/SMS).",
+                "   - Si un numéro apparaît (ex: +33 6..., 06...), extrais-le.",
+                "   - Formate-le simplement (ex: 0612345678 ou 33612345678). Enlève les espaces.",
+                "2. EMAIL : Cherche dans le corps ou l'expéditeur.",
+                "3. N’invente rien. Si absent: null.",
+                "4. best_key = tracking > order > email > phone.",
+                "5. has_enough = true si au moins une clé est trouvée."
               ].join("\n")
             },
             { type: "image_url", image_url: { url: dataUrl } }
@@ -80,8 +80,14 @@ async function extractDataFromImage(file) {
     });
 
     const text = response.choices[0].message.content?.trim() ?? "";
-    return JSON.parse(text);
+    // Petit filet de sécurité si l'IA renvoie du texte avant le JSON
+    const jsonStart = text.indexOf('{');
+    const jsonEnd = text.lastIndexOf('}');
+    if (jsonStart === -1 || jsonEnd === -1) throw new Error("Invalid JSON response from AI");
+    
+    return JSON.parse(text.substring(jsonStart, jsonEnd + 1));
 }
+
 
 // Logique de résolution (WooCommerce / Sendcloud)
 async function resolveTrackingLogic(extracted) {
