@@ -8,7 +8,6 @@ const upload = multer({
   limits: { fileSize: 8 * 1024 * 1024 }
 });
 
-// On gère le raw text si besoin, mais ici on renvoie surtout du text/plain
 app.use(express.json({ limit: "2mb" }));
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -27,20 +26,19 @@ function basicAuthHeader(user, pass) {
   return `Basic ${token}`;
 }
 
-// --- ÉTAPE 1 : EXTRACTION TECHNIQUE (Yeux bioniques pour les données) ---
+// ==========================================
+// ROUTE 1 : SAV TRACKING (Automatique)
+// ==========================================
 
 async function extractIdentifiers(file) {
     const b64 = file.buffer.toString("base64");
     const dataUrl = `data:${file.mimetype};base64,${b64}`;
 
     const response = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
+      model: "gpt-5-nano", // MODIFIÉ : Modèle rapide pour l'extraction
       response_format: { type: "json_object" },
       messages: [
-        {
-          role: "system",
-          content: "Tu es un extracteur de données techniques."
-        },
+        { role: "system", content: "Tu es un extracteur de données techniques." },
         {
           role: "user",
           content: [
@@ -51,17 +49,9 @@ async function extractIdentifiers(file) {
                 "JSON STRICT ATTENDU :",
                 "{",
                 '  "customer_first_name": string | null,',
-                '  "identifiers": {',
-                '     "email": null,',
-                '     "phone": null,',
-                '     "order_number": null,',
-                '     "tracking_number": null',
-                '  }',
+                '  "identifiers": { "email": null, "phone": null, "order_number": null, "tracking_number": null }',
                 "}",
-                "RÈGLES :",
-                "- Phone : Cherche dans le HEADER (haut de l'image). Nettoie les espaces.",
-                "- Prénom : Cherche dans le titre de la conversation.",
-                "- N'invente rien."
+                "RÈGLES : Phone dans le HEADER, Prénom dans le titre. N'invente rien."
               ].join("\n")
             },
             { type: "image_url", image_url: { url: dataUrl } }
@@ -69,16 +59,11 @@ async function extractIdentifiers(file) {
         }
       ]
     });
-
     const text = response.choices[0].message.content?.trim() ?? "";
     const jsonStart = text.indexOf('{');
     const jsonEnd = text.lastIndexOf('}');
-    if (jsonStart === -1 || jsonEnd === -1) throw new Error("Invalid JSON from AI extraction");
-    
     return JSON.parse(text.substring(jsonStart, jsonEnd + 1));
 }
-
-// --- ÉTAPE 2 : RECHERCHE (Logique Woo/Sendcloud) ---
 
 async function resolveTrackingLogic(identifiers) {
     const logs = [];
@@ -87,13 +72,10 @@ async function resolveTrackingLogic(identifiers) {
     const order_number_in = identifiers?.order_number ?? null;
     const tracking_in = identifiers?.tracking_number ?? null;
 
-    // 1. Tracking direct
     if (tracking_in) {
       const tracking = await sendcloudTrackByTrackingNumber(tracking_in);
       return { logs, data: tracking, tracking_number: tracking_in, woo_order: null };
     }
-
-    // 2. Numéro de commande
     if (order_number_in) {
       const parcels = await sendcloudFindParcelByOrderNumber(order_number_in);
       const tn = pickTrackingNumberFromParcelsResponse(parcels);
@@ -102,19 +84,14 @@ async function resolveTrackingLogic(identifiers) {
           return { logs, data: tracking, tracking_number: tn, woo_order: null };
       }
     }
-
-    // 3. Email
     if (email) {
       const res = await tryResolveViaWooSearch(email, logs);
       if (res) return res;
     }
-
-    // 4. Téléphone (Avec retry intelligent)
     if (phone) {
       let cleanPhone = phone.replace(/\D/g, ''); 
       let res = await tryResolveViaWooSearch(cleanPhone, logs);
       if (res) return res;
-
       if (cleanPhone.startsWith('33') && cleanPhone.length > 9) {
           let local = '0' + cleanPhone.substring(2);
           res = await tryResolveViaWooSearch(local, logs);
@@ -126,31 +103,24 @@ async function resolveTrackingLogic(identifiers) {
           if (res) return res;
       }
     }
-
     return { logs, data: null, tracking_number: null, woo_order: null };
 }
 
 async function tryResolveViaWooSearch(term, logs) {
     const woo = await wooLookupBySearchTerm(term);
     if (!woo.order_number) return null;
-
     const wooOrderFull = await wooFetchOrderById(woo.order_number); 
-
     let tn = woo.tracking_number;
     if (!tn) {
         const parcels = await sendcloudFindParcelByOrderNumber(woo.order_number);
         tn = pickTrackingNumberFromParcelsResponse(parcels);
     }
-
     if (tn) {
         const tracking = await sendcloudTrackByTrackingNumber(tn);
         return { logs, data: tracking, tracking_number: tn, woo_order: wooOrderFull };
     }
-    
     return { logs, data: null, tracking_number: null, woo_order: wooOrderFull, status: "processing_no_tracking" };
 }
-
-// --- ÉTAPE 3 : SIMPLIFICATION ---
 
 function simplifyContext(iaResult, resolutionResult) {
     let firstName = "Client";
@@ -159,137 +129,121 @@ function simplifyContext(iaResult, resolutionResult) {
     } else if (iaResult?.customer_first_name) {
         firstName = iaResult.customer_first_name;
     }
-
     const trackingData = resolutionResult?.data;
     const trackingNumber = resolutionResult?.tracking_number;
+    const trackingLink = trackingData?.carrier_tracking_url || trackingData?.sendcloud_tracking_url || (trackingNumber ? `https://www.laposte.fr/outils/suivre-vos-envois?code=${trackingNumber}` : null);
     
-    const trackingLink = trackingData?.carrier_tracking_url 
-                      || trackingData?.sendcloud_tracking_url 
-                      || (trackingNumber ? `https://www.laposte.fr/outils/suivre-vos-envois?code=${trackingNumber}` : null);
-
     let history = [];
     let lastHistoryStatus = null;
-
     if (trackingData?.statuses && Array.isArray(trackingData.statuses) && trackingData.statuses.length > 0) {
         const lastEntry = trackingData.statuses[trackingData.statuses.length - 1];
         lastHistoryStatus = lastEntry.carrier_message || lastEntry.status;
         history = trackingData.statuses.slice(-3).map(s => ` - ${s.carrier_message || s.status}`).reverse();
     }
-
-    const currentStatus = trackingData?.status?.message 
-                       || trackingData?.carrier_status 
-                       || lastHistoryStatus 
-                       || "En cours de traitement";
-
-    return {
-        first_name: firstName,
-        tracking_number: trackingNumber,
-        tracking_link: trackingLink,
-        current_status: currentStatus,
-        history: history.join("\n"),
-        is_found: !!trackingNumber
-    };
+    const currentStatus = trackingData?.status?.message || trackingData?.carrier_status || lastHistoryStatus || "En cours de traitement";
+    return { first_name: firstName, tracking_number: trackingNumber, tracking_link: trackingLink, current_status: currentStatus, history: history.join("\n"), is_found: !!trackingNumber };
 }
-
-// --- ÉTAPE 4 : ROBIN 🌞 (Rédaction avec Vision) ---
 
 async function draftResponseWithVision(data, file) {
     const b64 = file.buffer.toString("base64");
     const dataUrl = `data:${file.mimetype};base64,${b64}`;
-
-    // Prompt système "Robin"
     const systemPrompt = `
-    Tu es Robin du service après vente d'une petite marque de bijoux qui s'appelle Solstice, spécialisée dans les piercings. Tu es également experte en piercing.
-    Ton objectif est de répondre au client en t'adaptant parfaitement au contexte visuel et technique.
-
-    TON STYLE :
-    - Vouvoiement obligatoire.
-    - "Bonjour [Prénom],"
-    - 1 emoji par message MAX (sauf la signature).
-    - Signature obligatoire : "Robin 🌞"
-    - Interdiction stricte d'utiliser le caractère "—" (tiret cadratin).
-    - Ton : Courtois, poli, compréhensif, solaire, mais direct.
-    
-    ADAPTATION AU CONTEXTE VISUEL (Capture d'écran) :
-    - Analyse l'image pour déterminer la plateforme (WhatsApp, SMS, Mail, Instagram).
-    - Si c'est WhatsApp/SMS/Insta : Fais une réponse courte, fluide, style messagerie instantanée. Pas de "Cordialement", va droit au but.
-    - Si c'est un Mail : Garde une structure plus formelle (intro, corps, formule de politesse).
-    - Analyse le ton du client dans la capture (Est-il inquiet ? En colère ? Juste curieux ?). Adapte ton empathie (rassure s'il est inquiet).
-    
-    INFORMATIONS TECHNIQUES À DONNER :
-    - Statut du colis : ${data.current_status}
-    - Lien de suivi : ${data.tracking_link}
+    Tu es Robin du service après vente de Solstice Bijoux (piercing).
+    TON STYLE : Vouvoiement. "Bonjour [Prénom],". 1 emoji max. Signature : "Robin 🌞". Pas de tiret "—". Ton courtois, poli, compréhensif.
+    ADAPTATION : Analyse la plateforme (WhatsApp/Mail) pour la structure. Analyse l'émotion du client.
+    INFO : Statut: ${data.current_status}, Lien: ${data.tracking_link}.
     `;
-
-    // Prompt utilisateur (Cas FOUND ou NOT FOUND)
-    let userContentText = "";
-
-    if (data.is_found) {
-        userContentText = `
-        Le client s'appelle ${data.first_name}.
-        J'ai trouvé sa commande !
-        Confirme-lui que c'est tout bon. Donne-lui le statut (${data.current_status}) et le lien de suivi (${data.tracking_link}).
-        Si le statut indique que c'est livré mais qu'il demande où c'est, dis-lui de vérifier sa boîte aux lettres ou ses voisins.
-        `;
-    } else {
-        userContentText = `
-        Le client s'appelle ${data.first_name}.
-        Malheureusement, je n'ai pas réussi à retrouver sa commande avec les infos de l'image.
-        Excuse-toi et demande-lui poliment son numéro de commande ou l'email utilisé.
-        `;
-    }
+    let userContentText = data.is_found 
+        ? `Le client s'appelle ${data.first_name}. Commande trouvée ! Donne le statut et le lien.` 
+        : `Le client s'appelle ${data.first_name}. Commande non trouvée. Demande poliment le numéro ou l'email.`;
 
     const response = await openai.chat.completions.create({
-        model: "gpt-4o-mini", // Utilisation de GPT-4o Vision implicite via chat.completions
+        model: "gpt-5", // MODIFIÉ : Modèle puissant pour la rédaction
         messages: [
             { role: "system", content: systemPrompt },
-            { 
-                role: "user", 
-                content: [
-                    { type: "text", text: userContentText },
-                    { type: "image_url", image_url: { url: dataUrl } }
-                ] 
-            }
+            { role: "user", content: [{ type: "text", text: userContentText }, { type: "image_url", image_url: { url: dataUrl } }] }
         ]
     });
-
     return response.choices[0].message.content;
 }
-
-
-// --- ROUTE UNIQUE ---
 
 app.post("/sav/analyze", upload.single("image"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).send("Erreur: Image manquante");
-    
-    // 1. Extraction (Identification seulement)
     const extracted = await extractIdentifiers(req.file);
-    
-    // 2. Résolution (Woo/Sendcloud)
     const resolution = await resolveTrackingLogic(extracted.identifiers);
-    
-    // 3. Simplification
     const simpleContext = simplifyContext(extracted, resolution);
-
-    // 4. Rédaction (Robin avec Vision)
-    // On repasse le fichier image pour que Robin "voie" le contexte
     const finalText = await draftResponseWithVision(simpleContext, req.file);
-
-    // RETOUR TEXTE PUR (MIME Type: text/plain)
     res.setHeader('Content-Type', 'text/plain; charset=utf-8');
     return res.send(finalText);
-    
   } catch (e) {
     console.error(e);
-    // Retour texte pur même en cas d'erreur
     res.status(500).setHeader('Content-Type', 'text/plain; charset=utf-8');
-    return res.send("Bonjour,\n\nUne petite erreur technique m'empêche de récupérer votre suivi pour l'instant. Pourriez-vous me redonner votre numéro de commande ?\n\nMerci,\nRobin 🌞");
+    return res.send("Bonjour,\n\nUne erreur technique m'empêche de répondre. Pourriez-vous reformuler ?\n\nMerci,\nRobin 🌞");
   }
 });
 
 
-// --- CLIENTS API (Woo/Sendcloud) ---
+// ==========================================
+// ROUTE 2 : SAV GÉNÉRAL (Avec instructions)
+// ==========================================
+
+app.post("/sav/general", upload.single("image"), async (req, res) => {
+    try {
+        if (!req.file) return res.status(400).send("Erreur: Image manquante");
+
+        const instructions = req.body.instructions || "Analyse ce message et réponds de manière pertinente.";
+
+        const b64 = req.file.buffer.toString("base64");
+        const dataUrl = `data:${req.file.mimetype};base64,${b64}`;
+
+        const systemPrompt = `
+        Tu es Robin du service après vente de Solstice Bijoux, marque spécialisée dans les piercings. Tu es également experte en piercing.
+        
+        TON OBJECTIF :
+        Répondre au client en te basant sur la capture d'écran fournie ET les instructions spécifiques de ton manager.
+
+        TON STYLE (NON NÉGOCIABLE) :
+        - Vouvoiement obligatoire.
+        - "Bonjour [Prénom si visible sur l'image, sinon juste Bonjour],"
+        - 1 emoji par message MAX (sauf la signature).
+        - Signature obligatoire : "Robin 🌞"
+        - Interdiction stricte d'utiliser le caractère "—".
+        - Ton : Courtois, solaire, expert, empathique.
+        
+        ANALYSE VISUELLE :
+        - Adapte la forme de la réponse à la plateforme visible (WhatsApp = court / Mail = structuré).
+        - Repère le prénom du client si possible.
+        `;
+
+        const response = await openai.chat.completions.create({
+            model: "gpt-5", // MODIFIÉ : Modèle puissant pour la rédaction générale
+            messages: [
+                { role: "system", content: systemPrompt },
+                { 
+                    role: "user", 
+                    content: [
+                        { type: "text", text: `INSTRUCTIONS DU MANAGER : "${instructions}"` },
+                        { type: "image_url", image_url: { url: dataUrl } }
+                    ] 
+                }
+            ]
+        });
+
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+        return res.send(response.choices[0].message.content);
+
+    } catch (e) {
+        console.error(e);
+        res.status(500).setHeader('Content-Type', 'text/plain; charset=utf-8');
+        return res.send("Erreur lors de la génération de la réponse.\n\nRobin 🌞");
+    }
+});
+
+
+// ==========================================
+// CLIENTS API & SERVER START
+// ==========================================
 
 async function wooFetchOrdersBySearch(term) {
   const base = requireEnv("WC_BASE_URL").replace(/\/$/, "");
