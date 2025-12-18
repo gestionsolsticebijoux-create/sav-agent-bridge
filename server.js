@@ -32,15 +32,34 @@ function jsonError(res, status, message, details) {
 
 // --- LOGIQUE MÉTIER ---
 
+/**
+ * Fonction d'appel OpenAI générique pour gérer le retry de modèle
+ */
+async function callOpenAIWithFallback(messages, preferredModel = "gpt-5-nano") {
+    try {
+        // Tentative avec le modèle demandé (gpt-5-nano)
+        const response = await openai.chat.completions.create({
+            model: preferredModel,
+            response_format: { type: "json_object" },
+            messages: messages
+        });
+        return response;
+    } catch (e) {
+        // Si le modèle n'existe pas (404) ou autre erreur API, on fallback sur gpt-4o-mini
+        console.warn(`⚠️ ${preferredModel} a échoué (${e.status || e.message}). Bascule sur gpt-4o-mini.`);
+        return await openai.chat.completions.create({
+            model: "gpt-4o-mini",
+            response_format: { type: "json_object" },
+            messages: messages
+        });
+    }
+}
 
 async function extractDataFromImage(file) {
     const b64 = file.buffer.toString("base64");
     const dataUrl = `data:${file.mimetype};base64,${b64}`;
 
-    const response = await openai.chat.completions.create({
-      model: "gpt-5-nano",
-      response_format: { type: "json_object" },
-      messages: [
+    const messages = [
         {
           role: "system",
           content: "Tu es un extracteur d’informations SAV expert. Tu analyses des preuves visuelles (Email, WhatsApp, SMS)."
@@ -66,7 +85,7 @@ async function extractDataFromImage(file) {
                 "1. TÉLÉPHONE (Crucial) :",
                 "   - Regarde attentivement le HAUT de l'image (Barre de titre WhatsApp/SMS).",
                 "   - Si un numéro apparaît (ex: +33 6..., 06...), extrais-le.",
-                "   - Formate-le simplement (ex: 0612345678 ou 33612345678). Enlève les espaces.",
+                "   - Formate-le simplement (ex: 0612345678 ou 33612345678). Enlève les espaces et les tirets.",
                 "2. EMAIL : Cherche dans le corps ou l'expéditeur.",
                 "3. N’invente rien. Si absent: null.",
                 "4. best_key = tracking > order > email > phone.",
@@ -76,11 +95,12 @@ async function extractDataFromImage(file) {
             { type: "image_url", image_url: { url: dataUrl } }
           ]
         }
-      ]
-    });
+    ];
+
+    // Appel avec GPT-5-NANO (et fallback gpt-4o-mini si besoin)
+    const response = await callOpenAIWithFallback(messages, "gpt-5-nano");
 
     const text = response.choices[0].message.content?.trim() ?? "";
-    // Petit filet de sécurité si l'IA renvoie du texte avant le JSON
     const jsonStart = text.indexOf('{');
     const jsonEnd = text.lastIndexOf('}');
     if (jsonStart === -1 || jsonEnd === -1) throw new Error("Invalid JSON response from AI");
@@ -88,8 +108,7 @@ async function extractDataFromImage(file) {
     return JSON.parse(text.substring(jsonStart, jsonEnd + 1));
 }
 
-
-// Logique de résolution (WooCommerce / Sendcloud)
+// Logique de résolution (Email OU Téléphone avec Retry 33 vs 0)
 async function resolveTrackingLogic(extracted) {
     const logs = [];
     const email = extracted?.customer?.email ?? null;
@@ -101,14 +120,14 @@ async function resolveTrackingLogic(extracted) {
 
     // 1. Tracking direct
     if (tracking_in) {
-      logs.push("Tracking trouvé directement par l'IA. Interrogation Sendcloud...");
+      logs.push("Tracking trouvé directement. Interrogation Sendcloud...");
       const tracking = await sendcloudTrackByTrackingNumber(tracking_in);
       return { logs, path: "tracking_number_direct", final_status: tracking, tracking_number: tracking_in };
     }
 
     // 2. Numéro de commande direct
     if (order_number_in) {
-      logs.push(`Numéro de commande ${order_number_in} trouvé par l'IA. Recherche colis Sendcloud...`);
+      logs.push(`Numéro de commande ${order_number_in} trouvé. Recherche colis Sendcloud...`);
       const parcels = await sendcloudFindParcelByOrderNumber(order_number_in);
       const tn = pickTrackingNumberFromParcelsResponse(parcels);
       
@@ -126,30 +145,50 @@ async function resolveTrackingLogic(extracted) {
       logs.push(`Recherche commande WooCommerce via Email : ${email}`);
       const result = await tryResolveViaWooSearch(email, logs);
       if (result) return { ...result, path: "resolved_via_email" };
-      logs.push("Échec résolution via Email.");
+      logs.push("Échec résolution via Email. On continue...");
     }
 
-    // 4. Recherche via Téléphone (si le modèle l'extrait malgré le prompt simplifié, ou pour futur usage)
+    // 4. Recherche via Téléphone (INTELLIGENT)
     if (phone) {
-      logs.push(`Recherche commande WooCommerce via Téléphone : ${phone}`);
-      const result = await tryResolveViaWooSearch(phone, logs);
-      if (result) return { ...result, path: "resolved_via_phone" };
+      // Nettoyage de base
+      let cleanPhone = phone.replace(/\D/g, ''); 
+      
+      // Tentative 1 : Le numéro tel quel
+      logs.push(`Recherche Tel #1 (Format brut) : ${cleanPhone}`);
+      let result = await tryResolveViaWooSearch(cleanPhone, logs);
+      if (result) return { ...result, path: "resolved_via_phone_exact" };
+
+      // Tentative 2 : Si commence par 33, remplacer par 0
+      if (cleanPhone.startsWith('33') && cleanPhone.length > 9) {
+          let localPhone = '0' + cleanPhone.substring(2);
+          logs.push(`Recherche Tel #2 (Format FR '0...') : ${localPhone}`);
+          result = await tryResolveViaWooSearch(localPhone, logs);
+          if (result) return { ...result, path: "resolved_via_phone_localized" };
+      }
+
+      // Tentative 3 : Si commence par 0, remplacer par 33 (cas inverse)
+      if (cleanPhone.startsWith('0') && cleanPhone.length > 9) {
+          let interPhone = '33' + cleanPhone.substring(1);
+          logs.push(`Recherche Tel #3 (Format INT '33...') : ${interPhone}`);
+          result = await tryResolveViaWooSearch(interPhone, logs);
+          if (result) return { ...result, path: "resolved_via_phone_international" };
+      }
+
+      logs.push("Échec résolution via Téléphone après toutes les tentatives.");
     }
 
     logs.push("Aucune identification possible.");
     return { logs, path: "no_identifiers", final_status: null, tracking_number: null };
 }
 
-// Helper de résolution générique
 async function tryResolveViaWooSearch(searchTerm, logs) {
     const woo = await wooLookupBySearchTerm(searchTerm);
 
     if (!woo.order_number) {
-        logs.push(`WooCommerce : Aucune commande trouvée pour "${searchTerm}".`);
         return null;
     }
 
-    logs.push(`WooCommerce : Commande #${woo.order_number} trouvée !`);
+    logs.push(`WooCommerce : Commande #${woo.order_number} trouvée avec "${searchTerm}" !`);
 
     if (woo.tracking_number) {
         logs.push(`Tracking ${woo.tracking_number} lu dans Woo. Verify Sendcloud...`);
@@ -196,7 +235,7 @@ async function wooFetchOrdersBySearch(term) {
 
   const url = new URL(`${base}/wp-json/wc/v3/orders`);
   url.searchParams.set("search", term);
-  url.searchParams.set("per_page", "10");
+  url.searchParams.set("per_page", "5");
 
   const r = await fetch(url.toString(), {
     headers: { Authorization: basicAuthHeader(ck, cs), Accept: "application/json" }
