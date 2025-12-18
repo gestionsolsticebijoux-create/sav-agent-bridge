@@ -1,14 +1,28 @@
-﻿import express from "express";
+﻿import "dotenv/config"; // INDISPENSABLE pour charger les variables .env
+import express from "express";
 import multer from "multer";
 import OpenAI from "openai";
 
+// Vérifications de sécurité au démarrage
+if (!process.env.OPENAI_API_KEY) {
+    console.error("❌ ERREUR FATALE : OPENAI_API_KEY manquante.");
+    process.exit(1);
+}
+if (!process.env.TRACK17_KEY) {
+    console.error("⚠️ ATTENTION : TRACK17_KEY manquante. Le suivi international ne fonctionnera pas.");
+}
+
 const app = express();
+
+// On augmente la limite pour accepter les grosses images converties en Base64
+app.use(express.json({ limit: "50mb" }));
+app.use(express.urlencoded({ extended: true, limit: "50mb" }));
+
+// Configuration Multer (Upload images)
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 8 * 1024 * 1024 }
+  limits: { fileSize: 15 * 1024 * 1024 } // Augmenté à 15 Mo pour être tranquille
 });
-
-app.use(express.json({ limit: "2mb" }));
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -27,15 +41,17 @@ function basicAuthHeader(user, pass) {
 }
 
 // ==========================================
-// OUTILS COMMUNS (Extraction & Clients)
+// FONCTIONS D'EXTRACTION (VISION)
 // ==========================================
 
+// Fonction générique pour la route France (garde l'ancien fonctionnement)
 async function extractIdentifiers(file) {
     const b64 = file.buffer.toString("base64");
     const dataUrl = `data:${file.mimetype};base64,${b64}`;
 
+    // On utilise gpt-4o ici aussi pour être sûr de bien lire même si c'est penché
     const response = await openai.chat.completions.create({
-      model: "gpt-5-nano", // Extraction rapide
+      model: "gpt-4o", 
       response_format: { type: "json_object" },
       messages: [
         { role: "system", content: "Tu es un extracteur de données techniques." },
@@ -52,9 +68,9 @@ async function extractIdentifiers(file) {
                 '  "identifiers": { "email": null, "phone": null, "order_number": null, "tracking_number": null }',
                 "}",
                 "RÈGLES :",
-                "- Tracking Number : Cherche le code-barres ou le numéro de suivi sur l'étiquette (ex: 1Z..., L..., 87...).",
+                "- Tracking Number : Cherche le code-barres ou le numéro de suivi (ex: 1Z..., L..., 87...).",
                 "- Phone : Prends TOUS les chiffres.",
-                "- Prénom : Cherche sur l'étiquette d'expédition si visible."
+                "- Prénom : Cherche sur l'étiquette d'expédition."
               ].join("\n")
             },
             { type: "image_url", image_url: { url: dataUrl } }
@@ -68,53 +84,6 @@ async function extractIdentifiers(file) {
     return JSON.parse(text.substring(jsonStart, jsonEnd + 1));
 }
 
-// --- FONCTION SPÉCIALE : EXTRACTION TRACKING UNIQUEMENT ---
-async function extractTrackingSpecific(file) {
-    const b64 = file.buffer.toString("base64");
-    const dataUrl = `data:${file.mimetype};base64,${b64}`;
-
-    const response = await openai.chat.completions.create({
-      model: "gpt-5-nano", // Rapide et efficace pour l'OCR
-      response_format: { type: "json_object" },
-      messages: [
-        { 
-          role: "system", 
-          content: "Tu es un scanner optique spécialisé dans la lecture d'étiquettes d'expédition." 
-        },
-        {
-          role: "user",
-          content: [
-            {
-              type: "text",
-              text: [
-                "TA MISSION : Lire le Numéro de Suivi (Tracking Number) et le Prénom sur cette photo.",
-                "",
-                "JSON STRICT ATTENDU :",
-                "{",
-                '  "tracking_number": string | null, // Ex: "LA123456789FR", "1Z...", "87..."',
-                '  "first_name": string | null // Le prénom du destinataire',
-                "}",
-                "",
-                "CONSIGNES :",
-                "1. Cherche le code-barres principal ou la mention 'N° de suivi' / 'Tracking'.",
-                "2. Ignore les numéros de téléphone (+33...).",
-                "3. Si le numéro contient des espaces (ex: 'LA 123 456 FR'), supprime-les dans ta réponse.",
-                "4. Sois précis."
-              ].join("\n")
-            },
-            { type: "image_url", image_url: { url: dataUrl } }
-          ]
-        }
-      ]
-    });
-
-    const text = response.choices[0].message.content?.trim() ?? "";
-    const jsonStart = text.indexOf('{');
-    const jsonEnd = text.lastIndexOf('}');
-    if (jsonStart === -1 || jsonEnd === -1) throw new Error("Erreur lecture JSON IA");
-    
-    return JSON.parse(text.substring(jsonStart, jsonEnd + 1));
-}
 
 // ==========================================
 // ROUTE 1 : SAV TRACKING FRANCE (Automatique + Check Pays)
@@ -235,7 +204,7 @@ async function draftResponseWithVision(data, file) {
         : `Le client s'appelle ${data.first_name}. Commande non trouvée. Demande poliment le numéro ou l'email.`;
 
     const response = await openai.chat.completions.create({
-        model: "gpt-5", // Rédaction puissante
+        model: "gpt-4o",
         messages: [
             { role: "system", content: systemPrompt },
             { role: "user", content: [{ type: "text", text: userContentText }, { type: "image_url", image_url: { url: dataUrl } }] }
@@ -268,164 +237,208 @@ app.post("/sav/analyze", upload.single("image"), async (req, res) => {
 });
 
 
-// ==========================================
-// ROUTE 3 : SAV INTERNATIONAL (DEBUG MODE)
-// ==========================================
+// ====================================================================
+//  NOUVELLE ROUTE 2-A : /sav/extract
+//  (Prend l'image -> Renvoie JUSTE le numéro de suivi en texte brut)
+// ====================================================================
 
-app.post("/sav/international", upload.single("image"), async (req, res) => {
-    console.log("🔵 --- DÉBUT REQUÊTE INTERNATIONAL ---");
+app.post("/sav/extract", upload.single("image"), async (req, res) => {
+    console.log("\n🔵 [ROUTE /sav/extract] Début extraction...");
     
     try {
-        // CHECK 1 : Image
         if (!req.file) {
-            console.error("❌ ERREUR: Aucune image reçue dans la requête.");
+            console.error("❌ ERREUR: Aucune image reçue.");
             return res.status(400).send("Erreur: Image manquante");
         }
-        console.log(`✅ Image reçue. Taille: ${req.file.size} bytes. Mimetype: ${req.file.mimetype}`);
 
-        // CHECK 2 : Clé API 17TRACK
-        const track17Key = process.env.TRACK17_KEY;
-        if (!track17Key) {
-            console.error("❌ ERREUR CRITIQUE: La variable TRACK17_KEY est introuvable.");
-            throw new Error("Configuration manquante : TRACK17_KEY");
-        }
-        console.log("✅ Clé API 17TRACK détectée.");
+        const b64 = req.file.buffer.toString("base64");
+        const dataUrl = `data:${req.file.mimetype};base64,${b64}`;
 
-        // ÉTAPE 1 : Extraction OpenAI
-        console.log("📍 ÉTAPE 1 : Envoi image à OpenAI pour extraction...");
-        let extracted;
-        try {
-            extracted = await extractIdentifiers(req.file);
-            console.log("📄 Résultat extraction brut :", JSON.stringify(extracted));
-        } catch (openaiError) {
-            console.error("❌ ERREUR OPENAI (Extraction):", openaiError);
-            // Souvent c'est le nom du modèle (gpt-5 n'existe pas encore publiquement)
-            return res.status(500).send(`Erreur OpenAI Extraction: ${openaiError.message}`);
-        }
-
-        let trackingNumber = extracted.identifiers?.tracking_number;
-        
-        if (!trackingNumber) {
-             console.warn("⚠️ ALERTE: Aucun numéro de suivi trouvé par l'IA.");
-             return res.send("Bonjour,\n\nJe n'ai pas réussi à lire le numéro de suivi sur la photo. Pourriez-vous me l'écrire ?\n\nRobin 🌞");
-        }
-
-        const cleanTracking = trackingNumber.replace(/\s+/g, '').toUpperCase();
-        console.log(`✅ Numéro extrait et nettoyé : "${cleanTracking}"`);
-
-        // ÉTAPE 2 : Appel 17TRACK
-        console.log("📍 ÉTAPE 2 : Appel API 17TRACK (Register)...");
-        
-        let packageInfo = null;
-        
-        const registerResponse = await fetch("https://api.17track.net/track/v2.2/register", {
-            method: "POST",
-            headers: { "17token": track17Key, "Content-Type": "application/json" },
-            body: JSON.stringify([{ number: cleanTracking }])
+        // Appel GPT-4o avec le prompt "Anti-Rotation"
+        const response = await openai.chat.completions.create({
+            model: "gpt-4o", // Modèle le plus robuste
+            response_format: { type: "json_object" },
+            messages: [
+                { role: "system", content: "Tu es un lecteur optique de précision." },
+                { role: "user", content: [
+                    { 
+                        type: "text", 
+                        text: [
+                            "ANALYSE VISUELLE AVANCÉE (ROTATION POSSIBLE).",
+                            "Extrais le numéro de suivi (Tracking Number) visible sur cette étiquette.",
+                            "JSON ATTENDU : { \"tracking_number\": \"...\" }",
+                            "Règle : Ignore les espaces."
+                        ].join("\n")
+                    },
+                    { type: "image_url", image_url: { url: dataUrl } }
+                ]}
+            ]
         });
 
-        const trackData = await registerResponse.json();
-        console.log("📄 Réponse 17TRACK (Register) :", JSON.stringify(trackData));
+        const content = JSON.parse(response.choices[0].message.content);
+        const trackingNumber = content.tracking_number;
 
-        if (trackData?.data?.accepted?.length > 0) {
-            console.log("✅ Nouveau colis enregistré.");
-            packageInfo = trackData.data.accepted[0];
-        } 
-        else if (trackData?.data?.rejected?.length > 0) {
-            const error = trackData.data.rejected[0].error;
-            console.log(`⚠️ Rejeté par Register. Code: ${error.code} - Message: ${error.message}`);
-
-            if (error.code === -18019901) {
-                console.log("📍 Le numéro existe déjà. Tentative GetTrackInfo...");
-                
-                const infoResponse = await fetch("https://api.17track.net/track/v2.2/gettrackinfo", {
-                    method: "POST",
-                    headers: { "17token": track17Key, "Content-Type": "application/json" },
-                    body: JSON.stringify([{ number: cleanTracking }])
-                });
-                const infoData = await infoResponse.json();
-                console.log("📄 Réponse 17TRACK (GetInfo) :", JSON.stringify(infoData));
-                
-                if (infoData?.data?.accepted?.length > 0) {
-                    packageInfo = infoData.data.accepted[0];
-                    console.log("✅ Infos récupérées.");
-                }
-            }
+        if (!trackingNumber) {
+            console.warn("⚠️ Aucun numéro trouvé.");
+            return res.status(404).send("NON_TROUVE");
         }
 
-        // Préparation données pour Robin
-        let statusInfo = "En attente d'informations";
-        let historyText = "Pas d'historique disponible.";
-        let destination = "International";
-
-        if (packageInfo && packageInfo.track) {
-            const trackInfo = packageInfo.track;
-            const latestEvent = trackInfo.z1?.[0] || trackInfo.z0?.[0]; 
-            statusInfo = latestEvent ? latestEvent.z : "En transit";
-            destination = packageInfo.recipientCountry || "International";
-
-            const allEvents = [...(trackInfo.z0 || []), ...(trackInfo.z1 || [])]
-                .sort((a, b) => new Date(b.a) - new Date(a.a)) 
-                .slice(0, 5);
-            
-            if (allEvents.length > 0) {
-                historyText = allEvents.map(e => ` - ${e.a} : ${e.z}`).join("\n");
-            }
-        } else {
-            console.warn("⚠️ Aucune info de tracking trouvée, Robin va devoir improviser.");
-        }
-
-        // ÉTAPE 3 : Rédaction Robin
-        console.log("📍 ÉTAPE 3 : Génération de la réponse avec Robin...");
-        const b64Context = req.file.buffer.toString("base64");
-        const systemPrompt = `
-        Tu es Robin du service après vente de Solstice Bijoux.
-        CONTEXTE : Suivi International (17TRACK).
-        Numéro : ${cleanTracking}
-        Destination : ${destination}
-        DONNÉES TECHNIQUES :
-        - Statut Actuel : "${statusInfo}"
-        - Historique :
-        ${historyText}
-        TA MISSION :
-        - Rédige une réponse rassurante.
-        - Donne le lien : https://t.17track.net/fr#nums=${cleanTracking}
-        STYLE : "Bonjour [Prénom],", Vouvoiement, 1 emoji max, Signé "Robin 🌞".
-        `;
-
-        try {
-            const response = await openai.chat.completions.create({
-                model: "gpt-5", // ATTENTION : Si gpt-5 n'existe pas, mettre "gpt-4o"
-                messages: [
-                    { role: "system", content: systemPrompt },
-                    { 
-                        role: "user", 
-                        content: [
-                            { type: "text", text: "Photo du colis (pour le prénom)." },
-                            { type: "image_url", image_url: { url: `data:${req.file.mimetype};base64,${b64Context}` } }
-                        ] 
-                    }
-                ]
-            });
-            console.log("✅ Réponse générée.");
-            
-            res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-            return res.send(response.choices[0].message.content);
-
-        } catch (gptError) {
-            console.error("❌ ERREUR OPENAI (Rédaction):", gptError);
-            return res.status(500).send(`Erreur OpenAI Rédaction: ${gptError.message}`);
-        }
+        // Nettoyage : On ne garde que les chiffres et lettres majuscules
+        const cleanTracking = trackingNumber.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+        
+        console.log(`✅ Numéro trouvé et nettoyé : ${cleanTracking}`);
+        
+        // RENVOIE JUSTE LE TEXTE (Pas de JSON)
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+        return res.send(cleanTracking);
 
     } catch (e) {
-        console.error("💀 ERREUR GÉNÉRALE SERVEUR :", e);
-        res.status(500).setHeader('Content-Type', 'text/plain; charset=utf-8');
-        return res.send(`Erreur technique interne: ${e.message}`);
+        console.error("❌ ERREUR Extraction:", e);
+        res.status(500).send(`Erreur serveur: ${e.message}`);
     }
 });
 
+
+// ====================================================================
+//  NOUVELLE ROUTE 2-B : /sav/respond
+//  (Prend le Tracking + Image Context -> Renvoie la réponse Robin)
+// ====================================================================
+
+app.post("/sav/respond", upload.single("image"), async (req, res) => {
+    console.log("\n🔵 [ROUTE /sav/respond] Début analyse 17TRACK...");
+    
+    try {
+        // Récupération du numéro (envoyé comme champ texte "tracking_number")
+        const trackingNumber = req.body.tracking_number;
+        
+        if (!trackingNumber) {
+            console.error("❌ Erreur : Le champ 'tracking_number' est vide.");
+            return res.status(400).send("Erreur: tracking_number manquant.");
+        }
+
+        console.log(`1. Tracking reçu : ${trackingNumber}`);
+        console.log("2. Appel API 17TRACK...");
+
+        // APPEL 17TRACK (Register pour être sûr qu'il est suivi)
+        const trackResponse = await fetch("https://api.17track.net/track/v2.2/register", {
+            method: "POST",
+            headers: {
+                "17token": process.env.TRACK17_KEY,
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify([{ number: trackingNumber }])
+        });
+
+        const trackData = await trackResponse.json();
+        
+        // LOGIQUE D'ANALYSE DU STATUT 17TRACK
+        let statusInfo = "Inconnu / En attente";
+        let historyText = "Pas d'historique disponible.";
+        let destination = "International";
+
+        // Fonction helper pour extraire les infos d'un objet "accepted"
+        const parseTrackInfo = (info) => {
+            const dest = info.recipientCountry || "International";
+            const track = info.track;
+            let status = "En transit";
+            let history = "";
+
+            // Dernier événement (z0 = origine, z1 = destination)
+            const latest = track.z1?.[0] || track.z0?.[0];
+            if (latest) status = latest.z;
+
+            // Historique
+            const allEvents = [...(track.z0 || []), ...(track.z1 || [])]
+                .sort((a, b) => new Date(b.a) - new Date(a.a))
+                .slice(0, 3); // 3 derniers événements
+            
+            if (allEvents.length > 0) {
+                history = allEvents.map(e => ` - ${e.a} : ${e.z}`).join("\n");
+            }
+            return { dest, status, history };
+        };
+
+        if (trackData?.data?.accepted?.length > 0) {
+            const result = parseTrackInfo(trackData.data.accepted[0]);
+            destination = result.dest;
+            statusInfo = result.status;
+            historyText = result.history;
+        } 
+        else if (trackData?.data?.rejected?.length > 0) {
+            // Si rejeté car "déjà existant" (-18019901), on appelle GetInfo
+            const error = trackData.data.rejected[0].error;
+            if (error.code === -18019901) {
+                console.log("📍 Colis déjà suivi, récupération des infos...");
+                const infoResponse = await fetch("https://api.17track.net/track/v2.2/gettrackinfo", {
+                    method: "POST",
+                    headers: { "17token": process.env.TRACK17_KEY, "Content-Type": "application/json" },
+                    body: JSON.stringify([{ number: trackingNumber }])
+                });
+                const infoData = await infoResponse.json();
+                if (infoData?.data?.accepted?.length > 0) {
+                    const result = parseTrackInfo(infoData.data.accepted[0]);
+                    destination = result.dest;
+                    statusInfo = result.status;
+                    historyText = result.history;
+                }
+            } else {
+                console.warn(`⚠️ Rejeté par 17Track: ${error.message}`);
+                statusInfo = "Numéro non reconnu ou incorrect.";
+            }
+        }
+        
+        console.log(`3. Infos : Dest=${destination}, Status=${statusInfo}`);
+
+        // RÉDACTION ROBIN
+        console.log("4. Rédaction par Robin...");
+        
+        let messagesPayload = [
+            { role: "system", content: `Tu es Robin (SAV Solstice Bijoux). 
+             CONTEXTE TECHNIQUE : Colis ${trackingNumber} vers ${destination}.
+             STATUT ACTUEL : ${statusInfo}.
+             HISTORIQUE : ${historyText}.
+             
+             CONSIGNES :
+             - Vouvoiement.
+             - Donne le lien : https://t.17track.net/fr#nums=${trackingNumber}
+             - Sois rassurant, clair et court.
+             - 1 emoji max. Signature : "Robin 🌞".` 
+            }
+        ];
+
+        // Ajout de l'image de contexte (conversation WhatsApp) si présente
+        if (req.file) {
+            const b64 = req.file.buffer.toString("base64");
+            messagesPayload.push({
+                role: "user",
+                content: [
+                    { type: "text", text: "Voici la conversation avec le client. Adapte ton ton." },
+                    { type: "image_url", image_url: { url: `data:${req.file.mimetype};base64,${b64}` } }
+                ]
+            });
+        } else {
+            messagesPayload.push({ role: "user", content: "Rédige la réponse." });
+        }
+
+        const gptResponse = await openai.chat.completions.create({
+            model: "gpt-4o",
+            messages: messagesPayload
+        });
+
+        console.log("✅ Réponse générée.");
+        
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+        return res.send(gptResponse.choices[0].message.content);
+
+    } catch (e) {
+        console.error("❌ ERREUR REPONSE:", e);
+        res.status(500).send(`Erreur serveur: ${e.message}`);
+    }
+});
+
+
 // ==========================================
-// ROUTE 2 : SAV GÉNÉRAL (Avec instructions)
+// ROUTE 4 : SAV GÉNÉRAL (Avec instructions)
 // ==========================================
 
 app.post("/sav/general", upload.single("image"), async (req, res) => {
@@ -442,7 +455,7 @@ app.post("/sav/general", upload.single("image"), async (req, res) => {
         `;
 
         const response = await openai.chat.completions.create({
-            model: "gpt-5",
+            model: "gpt-4o",
             messages: [
                 { role: "system", content: systemPrompt },
                 { role: "user", content: [{ type: "image_url", image_url: { url: dataUrl } }] }
