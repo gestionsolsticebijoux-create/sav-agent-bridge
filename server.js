@@ -35,7 +35,7 @@ async function extractIdentifiers(file) {
     const dataUrl = `data:${file.mimetype};base64,${b64}`;
 
     const response = await openai.chat.completions.create({
-      model: "gpt-5-nano", // Modèle rapide pour l'extraction
+      model: "gpt-5-nano",
       response_format: { type: "json_object" },
       messages: [
         { role: "system", content: "Tu es un extracteur de données techniques." },
@@ -45,13 +45,15 @@ async function extractIdentifiers(file) {
             {
               type: "text",
               text: [
-                "Extrais les identifiants techniques de cette image.",
-                "JSON STRICT ATTENDU :",
+                "Extrais les identifiants techniques.",
+                "JSON ATTENDU :",
                 "{",
                 '  "customer_first_name": string | null,',
                 '  "identifiers": { "email": null, "phone": null, "order_number": null, "tracking_number": null }',
                 "}",
-                "RÈGLES : Phone dans le HEADER, Prénom dans le titre. N'invente rien."
+                "RÈGLES :",
+                "- Phone : Prends TOUS les chiffres (ex: 32..., 41..., 33...).",
+                "- Ne formate pas, garde la matière brute."
               ].join("\n")
             },
             { type: "image_url", image_url: { url: dataUrl } }
@@ -72,15 +74,11 @@ async function resolveTrackingLogic(identifiers) {
     const order_number_in = identifiers?.order_number ?? null;
     const tracking_in = identifiers?.tracking_number ?? null;
 
-    // 1. Si on a un numéro de commande, on vérifie d'abord le pays dans Woo
+    // 1. Commande Directe
     if (order_number_in) {
       const wooOrder = await wooFetchOrderById(order_number_in);
+      if (checkInternational(wooOrder)) return { isInternational: true, logs };
       
-      // VÉRIFICATION PAYS (STOP INTERNATIONAL)
-      if (wooOrder && wooOrder.shipping?.country && wooOrder.shipping.country !== 'FR') {
-          return { isInternational: true, logs };
-      }
-
       const parcels = await sendcloudFindParcelByOrderNumber(order_number_in);
       const tn = pickTrackingNumberFromParcelsResponse(parcels);
       if (tn) {
@@ -89,34 +87,46 @@ async function resolveTrackingLogic(identifiers) {
       }
     }
 
-    // 2. Recherche via Email
+    // 2. Email
     if (email) {
       const res = await tryResolveViaWooSearch(email, logs);
       if (res) return res;
     }
 
-    // 3. Recherche via Téléphone
+    // 3. Téléphone (STRATÉGIE "PARALLÈLE")
     if (phone) {
-      let cleanPhone = phone.replace(/\D/g, ''); 
-      let res = await tryResolveViaWooSearch(cleanPhone, logs);
-      if (res) return res;
-      if (cleanPhone.startsWith('33') && cleanPhone.length > 9) {
-          let local = '0' + cleanPhone.substring(2);
-          res = await tryResolveViaWooSearch(local, logs);
-          if (res) return res;
+      let rawDigits = phone.replace(/\D/g, ''); 
+      let candidates = new Set();
+      
+      candidates.add(rawDigits);
+      candidates.add('+' + rawDigits);
+      candidates.add('00' + rawDigits);
+
+      if (rawDigits.startsWith('33') && rawDigits.length > 9) candidates.add('0' + rawDigits.substring(2));
+      if (rawDigits.startsWith('0') && rawDigits.length === 10) {
+          candidates.add('33' + rawDigits.substring(1));
+          candidates.add('+33' + rawDigits.substring(1));
       }
-      if (cleanPhone.startsWith('0') && cleanPhone.length > 9) {
-          let inter = '33' + cleanPhone.substring(1);
-          res = await tryResolveViaWooSearch(inter, logs);
-          if (res) return res;
-      }
+      if (rawDigits.startsWith('32') && rawDigits.length > 8) candidates.add('0' + rawDigits.substring(2));
+      if (rawDigits.startsWith('41') && rawDigits.length > 8) candidates.add('0' + rawDigits.substring(2));
+
+      logs.push(`📞 Phone Candidates (Parallel): ${Array.from(candidates).join(', ')}`);
+
+      // LANCEMENT SIMULTANÉ DE TOUTES les RECHERCHES
+      const searchPromises = Array.from(candidates).map(c => tryResolveViaWooSearch(c, logs));
+      
+      // On attend que tout le monde ait fini
+      const results = await Promise.all(searchPromises);
+      
+      // On cherche le premier résultat valide (qui n'est pas null)
+      const validResult = results.find(r => r !== null);
+      
+      if (validResult) return validResult;
     }
 
-    // 4. Tracking direct (Cas rare où on a que le tracking sans commande)
-    // Ici on ne peut pas vérifier le pays via Woo facilement, on suppose FR ou on check Sendcloud destination
+    // 4. Tracking direct
     if (tracking_in) {
       const tracking = await sendcloudTrackByTrackingNumber(tracking_in);
-      // Sécurité supplémentaire : si Sendcloud dit que c'est pas FR
       if (tracking.destination && tracking.destination !== 'FR' && tracking.destination !== 'FRANCE') {
            return { isInternational: true, logs };
       }
@@ -126,26 +136,34 @@ async function resolveTrackingLogic(identifiers) {
     return { logs, data: null, tracking_number: null, woo_order: null };
 }
 
+function checkInternational(wooOrder) {
+    if (!wooOrder) return false;
+    const country = wooOrder.shipping?.country || wooOrder.billing?.country;
+    return (country && country !== 'FR');
+}
+
 async function tryResolveViaWooSearch(term, logs) {
     const woo = await wooLookupBySearchTerm(term);
     if (!woo.order_number) return null;
     
-    // VÉRIFICATION PAYS (STOP INTERNATIONAL)
-    // woo.country est récupéré par wooLookupBySearchTerm
+    // STOP INTERNATIONAL
     if (woo.country && woo.country !== 'FR') {
         return { isInternational: true, logs };
     }
 
     const wooOrderFull = await wooFetchOrderById(woo.order_number); 
     let tn = woo.tracking_number;
+    
     if (!tn) {
         const parcels = await sendcloudFindParcelByOrderNumber(woo.order_number);
         tn = pickTrackingNumberFromParcelsResponse(parcels);
     }
+    
     if (tn) {
         const tracking = await sendcloudTrackByTrackingNumber(tn);
         return { logs, data: tracking, tracking_number: tn, woo_order: wooOrderFull };
     }
+    
     return { logs, data: null, tracking_number: null, woo_order: wooOrderFull, status: "processing_no_tracking" };
 }
 
@@ -185,7 +203,7 @@ async function draftResponseWithVision(data, file) {
         : `Le client s'appelle ${data.first_name}. Commande non trouvée. Demande poliment le numéro ou l'email.`;
 
     const response = await openai.chat.completions.create({
-        model: "gpt-5", // Modèle puissant pour la rédaction
+        model: "gpt-5",
         messages: [
             { role: "system", content: systemPrompt },
             { role: "user", content: [{ type: "text", text: userContentText }, { type: "image_url", image_url: { url: dataUrl } }] }
@@ -201,7 +219,6 @@ app.post("/sav/analyze", upload.single("image"), async (req, res) => {
     const extracted = await extractIdentifiers(req.file);
     const resolution = await resolveTrackingLogic(extracted.identifiers);
 
-    // STOP INTERNATIONAL : Si le flag est levé, on renvoie juste le mot et on s'arrête
     if (resolution.isInternational) {
         res.setHeader('Content-Type', 'text/plain; charset=utf-8');
         return res.send("international");
@@ -228,40 +245,20 @@ app.post("/sav/general", upload.single("image"), async (req, res) => {
         if (!req.file) return res.status(400).send("Erreur: Image manquante");
 
         const instructions = req.body.instructions || "Analyse ce message et réponds de manière pertinente.";
-
         const b64 = req.file.buffer.toString("base64");
         const dataUrl = `data:${req.file.mimetype};base64,${b64}`;
 
         const systemPrompt = `
-        Tu es Robin du service après vente de Solstice Bijoux, marque spécialisée dans les piercings. Tu es également experte en piercing.
-        
-        TON OBJECTIF :
-        Répondre au client en te basant sur la capture d'écran fournie ET les instructions spécifiques de ton manager.
-
-        TON STYLE (NON NÉGOCIABLE) :
-        - Vouvoiement obligatoire.
-        - "Bonjour [Prénom si visible sur l'image, sinon juste Bonjour],"
-        - 1 emoji par message MAX (sauf la signature).
-        - Signature obligatoire : "Robin 🌞"
-        - Interdiction stricte d'utiliser le caractère "—".
-        - Ton : Courtois, solaire, expert, empathique.
-        
-        ANALYSE VISUELLE :
-        - Adapte la forme de la réponse à la plateforme visible (WhatsApp = court / Mail = structuré).
-        - Repère le prénom du client si possible.
+        Tu es Robin du service après vente de Solstice Bijoux.
+        TON STYLE : Vouvoiement. "Bonjour [Prénom],". 1 emoji max. Signature : "Robin 🌞". Pas de tiret "—".
+        OBJECTIF: Répondre selon les instructions : "${instructions}"
         `;
 
         const response = await openai.chat.completions.create({
-            model: "gpt-5", // Modèle puissant pour la rédaction générale
+            model: "gpt-5",
             messages: [
                 { role: "system", content: systemPrompt },
-                { 
-                    role: "user", 
-                    content: [
-                        { type: "text", text: `INSTRUCTIONS DU MANAGER : "${instructions}"` },
-                        { type: "image_url", image_url: { url: dataUrl } }
-                    ] 
-                }
+                { role: "user", content: [{ type: "image_url", image_url: { url: dataUrl } }] }
             ]
         });
 
@@ -277,7 +274,7 @@ app.post("/sav/general", upload.single("image"), async (req, res) => {
 
 
 // ==========================================
-// CLIENTS API & SERVER START
+// CLIENTS API
 // ==========================================
 
 async function wooFetchOrdersBySearch(term) {
@@ -312,10 +309,7 @@ async function wooLookupBySearchTerm(term) {
       const hit = meta.find(m => m.key === k && m.value);
       if(hit) tn = hit.value;
   }
-  
-  // NOUVEAU : On récupère aussi le pays pour la vérification
   const country = latest.shipping?.country || latest.billing?.country || "FR";
-  
   return { order_number: latest.id, tracking_number: tn, country: country };
 }
 
