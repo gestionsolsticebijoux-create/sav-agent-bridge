@@ -35,7 +35,7 @@ async function extractIdentifiers(file) {
     const dataUrl = `data:${file.mimetype};base64,${b64}`;
 
     const response = await openai.chat.completions.create({
-      model: "gpt-5-nano", // MODIFIÉ : Modèle rapide pour l'extraction
+      model: "gpt-5-nano", // Modèle rapide pour l'extraction
       response_format: { type: "json_object" },
       messages: [
         { role: "system", content: "Tu es un extracteur de données techniques." },
@@ -72,22 +72,30 @@ async function resolveTrackingLogic(identifiers) {
     const order_number_in = identifiers?.order_number ?? null;
     const tracking_in = identifiers?.tracking_number ?? null;
 
-    if (tracking_in) {
-      const tracking = await sendcloudTrackByTrackingNumber(tracking_in);
-      return { logs, data: tracking, tracking_number: tracking_in, woo_order: null };
-    }
+    // 1. Si on a un numéro de commande, on vérifie d'abord le pays dans Woo
     if (order_number_in) {
+      const wooOrder = await wooFetchOrderById(order_number_in);
+      
+      // VÉRIFICATION PAYS (STOP INTERNATIONAL)
+      if (wooOrder && wooOrder.shipping?.country && wooOrder.shipping.country !== 'FR') {
+          return { isInternational: true, logs };
+      }
+
       const parcels = await sendcloudFindParcelByOrderNumber(order_number_in);
       const tn = pickTrackingNumberFromParcelsResponse(parcels);
       if (tn) {
           const tracking = await sendcloudTrackByTrackingNumber(tn);
-          return { logs, data: tracking, tracking_number: tn, woo_order: null };
+          return { logs, data: tracking, tracking_number: tn, woo_order: wooOrder };
       }
     }
+
+    // 2. Recherche via Email
     if (email) {
       const res = await tryResolveViaWooSearch(email, logs);
       if (res) return res;
     }
+
+    // 3. Recherche via Téléphone
     if (phone) {
       let cleanPhone = phone.replace(/\D/g, ''); 
       let res = await tryResolveViaWooSearch(cleanPhone, logs);
@@ -103,12 +111,31 @@ async function resolveTrackingLogic(identifiers) {
           if (res) return res;
       }
     }
+
+    // 4. Tracking direct (Cas rare où on a que le tracking sans commande)
+    // Ici on ne peut pas vérifier le pays via Woo facilement, on suppose FR ou on check Sendcloud destination
+    if (tracking_in) {
+      const tracking = await sendcloudTrackByTrackingNumber(tracking_in);
+      // Sécurité supplémentaire : si Sendcloud dit que c'est pas FR
+      if (tracking.destination && tracking.destination !== 'FR' && tracking.destination !== 'FRANCE') {
+           return { isInternational: true, logs };
+      }
+      return { logs, data: tracking, tracking_number: tracking_in, woo_order: null };
+    }
+
     return { logs, data: null, tracking_number: null, woo_order: null };
 }
 
 async function tryResolveViaWooSearch(term, logs) {
     const woo = await wooLookupBySearchTerm(term);
     if (!woo.order_number) return null;
+    
+    // VÉRIFICATION PAYS (STOP INTERNATIONAL)
+    // woo.country est récupéré par wooLookupBySearchTerm
+    if (woo.country && woo.country !== 'FR') {
+        return { isInternational: true, logs };
+    }
+
     const wooOrderFull = await wooFetchOrderById(woo.order_number); 
     let tn = woo.tracking_number;
     if (!tn) {
@@ -158,7 +185,7 @@ async function draftResponseWithVision(data, file) {
         : `Le client s'appelle ${data.first_name}. Commande non trouvée. Demande poliment le numéro ou l'email.`;
 
     const response = await openai.chat.completions.create({
-        model: "gpt-5", // MODIFIÉ : Modèle puissant pour la rédaction
+        model: "gpt-5", // Modèle puissant pour la rédaction
         messages: [
             { role: "system", content: systemPrompt },
             { role: "user", content: [{ type: "text", text: userContentText }, { type: "image_url", image_url: { url: dataUrl } }] }
@@ -170,8 +197,16 @@ async function draftResponseWithVision(data, file) {
 app.post("/sav/analyze", upload.single("image"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).send("Erreur: Image manquante");
+    
     const extracted = await extractIdentifiers(req.file);
     const resolution = await resolveTrackingLogic(extracted.identifiers);
+
+    // STOP INTERNATIONAL : Si le flag est levé, on renvoie juste le mot et on s'arrête
+    if (resolution.isInternational) {
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+        return res.send("international");
+    }
+
     const simpleContext = simplifyContext(extracted, resolution);
     const finalText = await draftResponseWithVision(simpleContext, req.file);
     res.setHeader('Content-Type', 'text/plain; charset=utf-8');
@@ -217,7 +252,7 @@ app.post("/sav/general", upload.single("image"), async (req, res) => {
         `;
 
         const response = await openai.chat.completions.create({
-            model: "gpt-5", // MODIFIÉ : Modèle puissant pour la rédaction générale
+            model: "gpt-5", // Modèle puissant pour la rédaction générale
             messages: [
                 { role: "system", content: systemPrompt },
                 { 
@@ -277,7 +312,11 @@ async function wooLookupBySearchTerm(term) {
       const hit = meta.find(m => m.key === k && m.value);
       if(hit) tn = hit.value;
   }
-  return { order_number: latest.id, tracking_number: tn };
+  
+  // NOUVEAU : On récupère aussi le pays pour la vérification
+  const country = latest.shipping?.country || latest.billing?.country || "FR";
+  
+  return { order_number: latest.id, tracking_number: tn, country: country };
 }
 
 async function sendcloudGet(path) {
