@@ -3,6 +3,10 @@ import express from "express";
 import multer from "multer";
 import OpenAI from "openai";
 
+// ==========================================
+// 1. CONFIGURATION & SÉCURITÉ
+// ==========================================
+
 // Vérifications de sécurité au démarrage
 if (!process.env.OPENAI_API_KEY) {
     console.error("❌ ERREUR FATALE : OPENAI_API_KEY manquante.");
@@ -14,21 +18,22 @@ if (!process.env.TRACK17_KEY) {
 
 const app = express();
 
-// On augmente la limite pour accepter les grosses images converties en Base64
+// Configuration Express pour accepter les gros payloads (Base64)
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 
 // Configuration Multer (Upload images)
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 15 * 1024 * 1024 } // Augmenté à 15 Mo pour être tranquille
+  limits: { fileSize: 15 * 1024 * 1024 } // 15 Mo
 });
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-/**
- * Helpers
- */
+// ==========================================
+// 2. HELPERS (OUTILS)
+// ==========================================
+
 function requireEnv(name) {
   const v = process.env[name];
   if (!v) throw new Error(`Missing env var: ${name}`);
@@ -40,16 +45,47 @@ function basicAuthHeader(user, pass) {
   return `Basic ${token}`;
 }
 
+// Helper pour parser proprement la réponse 17Track
+function parseTrackInfo(info) {
+    const dest = info.recipientCountry || "International";
+    const track = info.track;
+    
+    // Sécurité : si track est null (pas encore d'info)
+    if (!track) {
+        return { 
+            dest, 
+            status: "En attente de mise à jour transporteur", 
+            history: "Information en cours de récupération..." 
+        };
+    }
+
+    let status = "En transit";
+    let history = "";
+
+    // Dernier événement (z0 = origine, z1 = destination)
+    const latest = track.z1?.[0] || track.z0?.[0];
+    if (latest && latest.z) status = latest.z;
+
+    // Historique (3 derniers événements)
+    const allEvents = [...(track.z0 || []), ...(track.z1 || [])]
+        .sort((a, b) => new Date(b.a) - new Date(a.a))
+        .slice(0, 3);
+    
+    if (allEvents.length > 0) {
+        history = allEvents.map(e => ` - ${e.a} : ${e.z}`).join("\n");
+    }
+    return { dest, status, history };
+}
+
 // ==========================================
-// FONCTIONS D'EXTRACTION (VISION)
+// 3. FONCTIONS MÉTIER (LOGIQUE)
 // ==========================================
 
-// Fonction générique pour la route France (garde l'ancien fonctionnement)
+// Extraction Vision (Utilisée par Route 1 et 2A)
 async function extractIdentifiers(file) {
     const b64 = file.buffer.toString("base64");
     const dataUrl = `data:${file.mimetype};base64,${b64}`;
 
-    // On utilise gpt-4o ici aussi pour être sûr de bien lire même si c'est penché
     const response = await openai.chat.completions.create({
       model: "gpt-4o", 
       response_format: { type: "json_object" },
@@ -84,11 +120,7 @@ async function extractIdentifiers(file) {
     return JSON.parse(text.substring(jsonStart, jsonEnd + 1));
 }
 
-
-// ==========================================
-// ROUTE 1 : SAV TRACKING FRANCE (Automatique + Check Pays)
-// ==========================================
-
+// Logique de résolution (WooCommerce -> Sendcloud -> Pays)
 async function resolveTrackingLogic(identifiers) {
     const logs = [];
     const email = identifiers?.email ?? null;
@@ -213,6 +245,10 @@ async function draftResponseWithVision(data, file) {
     return response.choices[0].message.content;
 }
 
+// ==========================================
+// ROUTE 1 : SAV TRACKING FRANCE (Legacy)
+// ==========================================
+
 app.post("/sav/analyze", upload.single("image"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).send("Erreur: Image manquante");
@@ -237,10 +273,9 @@ app.post("/sav/analyze", upload.single("image"), async (req, res) => {
 });
 
 
-// ====================================================================
-//  NOUVELLE ROUTE 2-A : /sav/extract
-//  (Prend l'image -> Renvoie JUSTE le numéro de suivi en texte brut)
-// ====================================================================
+// ==========================================
+// ROUTE 2-A : EXTRACTION PURE (Image -> Texte)
+// ==========================================
 
 app.post("/sav/extract", upload.single("image"), async (req, res) => {
     console.log("\n🔵 [ROUTE /sav/extract] Début extraction...");
@@ -254,9 +289,8 @@ app.post("/sav/extract", upload.single("image"), async (req, res) => {
         const b64 = req.file.buffer.toString("base64");
         const dataUrl = `data:${req.file.mimetype};base64,${b64}`;
 
-        // Appel GPT-4o avec le prompt "Anti-Rotation"
         const response = await openai.chat.completions.create({
-            model: "gpt-4o", // Modèle le plus robuste
+            model: "gpt-4o", // Modèle robuste pour la rotation
             response_format: { type: "json_object" },
             messages: [
                 { role: "system", content: "Tu es un lecteur optique de précision." },
@@ -288,7 +322,6 @@ app.post("/sav/extract", upload.single("image"), async (req, res) => {
         
         console.log(`✅ Numéro trouvé et nettoyé : ${cleanTracking}`);
         
-        // RENVOIE JUSTE LE TEXTE (Pas de JSON)
         res.setHeader('Content-Type', 'text/plain; charset=utf-8');
         return res.send(cleanTracking);
 
@@ -299,16 +332,15 @@ app.post("/sav/extract", upload.single("image"), async (req, res) => {
 });
 
 
-// ====================================================================
-//  NOUVELLE ROUTE 2-B : /sav/respond
-//  (Prend le Tracking + Image Context -> Renvoie la réponse Robin)
-// ====================================================================
+// ==========================================
+// ROUTE 2-B : RÉPONSE SAV INTERNATIONAL
+// ==========================================
+// 
 
 app.post("/sav/respond", upload.single("image"), async (req, res) => {
     console.log("\n🔵 [ROUTE /sav/respond] Début analyse 17TRACK...");
     
     try {
-        // Récupération du numéro (envoyé comme champ texte "tracking_number")
         const trackingNumber = req.body.tracking_number;
         
         if (!trackingNumber) {
@@ -319,7 +351,7 @@ app.post("/sav/respond", upload.single("image"), async (req, res) => {
         console.log(`1. Tracking reçu : ${trackingNumber}`);
         console.log("2. Appel API 17TRACK...");
 
-        // APPEL 17TRACK (Register pour être sûr qu'il est suivi)
+        // APPEL 17TRACK
         const trackResponse = await fetch("https://api.17track.net/track/v2.2/register", {
             method: "POST",
             headers: {
@@ -331,50 +363,34 @@ app.post("/sav/respond", upload.single("image"), async (req, res) => {
 
         const trackData = await trackResponse.json();
         
-        // LOGIQUE D'ANALYSE DU STATUT 17TRACK
         let statusInfo = "Inconnu / En attente";
         let historyText = "Pas d'historique disponible.";
         let destination = "International";
 
-        // Fonction helper pour extraire les infos d'un objet "accepted"
-        const parseTrackInfo = (info) => {
-            const dest = info.recipientCountry || "International";
-            const track = info.track;
-            let status = "En transit";
-            let history = "";
-
-            // Dernier événement (z0 = origine, z1 = destination)
-            const latest = track.z1?.[0] || track.z0?.[0];
-            if (latest) status = latest.z;
-
-            // Historique
-            const allEvents = [...(track.z0 || []), ...(track.z1 || [])]
-                .sort((a, b) => new Date(b.a) - new Date(a.a))
-                .slice(0, 3); // 3 derniers événements
-            
-            if (allEvents.length > 0) {
-                history = allEvents.map(e => ` - ${e.a} : ${e.z}`).join("\n");
-            }
-            return { dest, status, history };
-        };
+        // --- LOGIQUE DE RÉCUPÉRATION ROBUSTE ---
 
         if (trackData?.data?.accepted?.length > 0) {
+            // CAS 1 : Enregistrement réussi, on parse direct
             const result = parseTrackInfo(trackData.data.accepted[0]);
             destination = result.dest;
             statusInfo = result.status;
             historyText = result.history;
         } 
         else if (trackData?.data?.rejected?.length > 0) {
-            // Si rejeté car "déjà existant" (-18019901), on appelle GetInfo
+            // CAS 2 : Rejeté. Souvent car "déjà existant" (-18019901)
             const error = trackData.data.rejected[0].error;
+            
             if (error.code === -18019901) {
-                console.log("📍 Colis déjà suivi, récupération des infos...");
+                console.log("📍 Colis déjà suivi, appel endpoint 'gettrackinfo'...");
+                
                 const infoResponse = await fetch("https://api.17track.net/track/v2.2/gettrackinfo", {
                     method: "POST",
                     headers: { "17token": process.env.TRACK17_KEY, "Content-Type": "application/json" },
                     body: JSON.stringify([{ number: trackingNumber }])
                 });
+                
                 const infoData = await infoResponse.json();
+                
                 if (infoData?.data?.accepted?.length > 0) {
                     const result = parseTrackInfo(infoData.data.accepted[0]);
                     destination = result.dest;
@@ -382,14 +398,14 @@ app.post("/sav/respond", upload.single("image"), async (req, res) => {
                     historyText = result.history;
                 }
             } else {
-                console.warn(`⚠️ Rejeté par 17Track: ${error.message}`);
+                console.warn(`⚠️ Rejeté par 17Track (Autre raison): ${error.message}`);
                 statusInfo = "Numéro non reconnu ou incorrect.";
             }
         }
         
-        console.log(`3. Infos : Dest=${destination}, Status=${statusInfo}`);
+        console.log(`3. Infos récupérées : Dest=${destination}, Status=${statusInfo}`);
 
-        // RÉDACTION ROBIN
+        // --- RÉDACTION ROBIN ---
         console.log("4. Rédaction par Robin...");
         
         let messagesPayload = [
@@ -406,7 +422,7 @@ app.post("/sav/respond", upload.single("image"), async (req, res) => {
             }
         ];
 
-        // Ajout de l'image de contexte (conversation WhatsApp) si présente
+        // Ajout de l'image contextuelle (conversation WhatsApp)
         if (req.file) {
             const b64 = req.file.buffer.toString("base64");
             messagesPayload.push({
@@ -438,7 +454,7 @@ app.post("/sav/respond", upload.single("image"), async (req, res) => {
 
 
 // ==========================================
-// ROUTE 4 : SAV GÉNÉRAL (Avec instructions)
+// ROUTE 4 : SAV GÉNÉRAL (Instructions libres)
 // ==========================================
 
 app.post("/sav/general", upload.single("image"), async (req, res) => {
@@ -471,8 +487,9 @@ app.post("/sav/general", upload.single("image"), async (req, res) => {
     }
 });
 
+
 // ==========================================
-// CLIENTS API
+// CLIENTS API (WooCommerce & Sendcloud)
 // ==========================================
 
 async function wooFetchOrdersBySearch(term) {
