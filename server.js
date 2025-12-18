@@ -10,6 +10,7 @@ const upload = multer({
 
 app.use(express.json({ limit: "2mb" }));
 
+// Assure-toi que la clé est bien dans ton .env
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 /**
@@ -40,16 +41,21 @@ app.post("/sav/extract", upload.single("image"), async (req, res) => {
     const b64 = req.file.buffer.toString("base64");
     const dataUrl = `data:${req.file.mimetype};base64,${b64}`;
 
-    const response = await openai.responses.create({
-      model: "gpt-5-nano",
-      input: [
+    // CORRECTION : Utilisation de chat.completions.create et gpt-4o-mini
+    const response = await openai.chat.completions.create({
+      model: "gpt-4o-mini", // Modèle valide et économique
+      response_format: { type: "json_object" }, // Force le retour JSON
+      messages: [
+        {
+          role: "system",
+          content: "Tu es un extracteur d’informations SAV. Tu retournes toujours du JSON valide."
+        },
         {
           role: "user",
           content: [
             {
-              type: "input_text",
+              type: "text",
               text: [
-                "Tu es un extracteur d’informations SAV.",
                 "Entrée: une capture d’écran d’un email SAV.",
                 "Retourne UNIQUEMENT un JSON valide avec ce schéma:",
                 "{",
@@ -61,17 +67,23 @@ app.post("/sav/extract", upload.single("image"), async (req, res) => {
                 "Règles:",
                 "- N’invente rien. Si absent ou incertain: null.",
                 "- best_key = tracking_number si tracking_number non-null, sinon order_number, sinon email, sinon null.",
-                "- has_enough = true si best_key != null, sinon false.",
-                "Ne renvoie aucun texte hors JSON."
+                "- has_enough = true si best_key != null, sinon false."
               ].join("\n")
             },
-            { type: "input_image", image_url: dataUrl }
+            {
+              type: "image_url",
+              image_url: {
+                url: dataUrl
+              }
+            }
           ]
         }
       ]
     });
 
-    const text = response.output_text?.trim() ?? "";
+    // CORRECTION : Lecture correcte de la réponse OpenAI
+    const text = response.choices[0].message.content?.trim() ?? "";
+    
     let parsed;
     try {
       parsed = JSON.parse(text);
@@ -80,6 +92,7 @@ app.post("/sav/extract", upload.single("image"), async (req, res) => {
     }
     return res.json(parsed);
   } catch (e) {
+    console.error(e);
     return jsonError(res, 500, "sav_extract_failed", String(e?.message || e));
   }
 });
@@ -186,8 +199,6 @@ async function sendcloudTrackByTrackingNumber(tracking_number) {
 }
 
 function pickTrackingNumberFromParcelsResponse(payload) {
-  // Correction: ton code avait un bug de priorité avec "?:".
-  // Ici on choisit explicitement la première liste plausible.
   const candidates =
     payload?.parcels ??
     payload?.results ??
