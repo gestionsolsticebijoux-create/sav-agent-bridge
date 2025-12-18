@@ -223,57 +223,116 @@ app.post("/sav/analyze", upload.single("image"), async (req, res) => {
 
 
 // ==========================================
-// ROUTE 3 : SAV INTERNATIONAL (Photo Colis Direct)
+// ROUTE 3 : SAV INTERNATIONAL (via 17TRACK API)
 // ==========================================
 
 app.post("/sav/international", upload.single("image"), async (req, res) => {
     try {
         if (!req.file) return res.status(400).send("Erreur: Image manquante");
 
-        // 1. Extraction (On cherche spécifiquement le tracking sur l'étiquette)
+        // 1. Extraction du numéro sur TA photo
         const extracted = await extractIdentifiers(req.file);
-        
         let trackingNumber = extracted.identifiers?.tracking_number;
 
         if (!trackingNumber) {
              res.setHeader('Content-Type', 'text/plain; charset=utf-8');
              return res.send("Bonjour,\n\nJe n'ai pas réussi à lire le numéro de suivi sur la photo. Pourriez-vous me l'écrire ?\n\nRobin 🌞");
         }
+        
+        // Nettoyage
+        const cleanTracking = trackingNumber.replace(/\s+/g, '').toUpperCase();
 
-        // 2. Nettoyage (Suppression des espaces)
-        const cleanTracking = trackingNumber.replace(/\s+/g, '');
+        // 2. Appel API 17TRACK (Beaucoup plus fiable que la capture d'écran)
+        const track17Key = process.env.TRACK17_KEY;
+        if (!track17Key) throw new Error("Missing TRACK17_KEY env var");
 
-        // 3. Appel direct Sendcloud (Pas de check Woo, c'est l'international assumé)
-        let trackingData;
-        try {
-            trackingData = await sendcloudTrackByTrackingNumber(cleanTracking);
-        } catch (e) {
-            // Si le tracking n'existe pas encore
-            trackingData = null;
+        // On doit faire un POST pour enregistrer/récupérer le suivi
+        const trackResponse = await fetch("https://api.17track.net/track/v2.2/register", {
+            method: "POST",
+            headers: {
+                "17token": track17Key,
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify([
+                { number: cleanTracking } // 17TRACK détecte auto le transporteur (La Poste etc)
+            ])
+        });
+
+        const trackData = await trackResponse.json();
+        
+        // Analyse de la réponse 17TRACK
+        let statusInfo = "Inconnu";
+        let historyText = "";
+        let destination = "International";
+
+        if (trackData?.data?.accepted?.length > 0) {
+            const info = trackData.data.accepted[0];
+            const trackInfo = info.track;
+            
+            // Dernier événement (le plus récent)
+            const latestEvent = trackInfo.z1?.[0] || trackInfo.z0?.[0]; // z1 = destination, z0 = origine
+            
+            statusInfo = latestEvent ? latestEvent.z : "En transit"; // .z = description de l'événement
+            destination = info.recipientCountry || "International";
+
+            // Historique simplifié pour Robin (les 3 derniers événements)
+            // On combine les événements origine (z0) et destination (z1) et on trie par date
+            const allEvents = [...(trackInfo.z0 || []), ...(trackInfo.z1 || [])]
+                .sort((a, b) => new Date(b.a) - new Date(a.a)) // Tri décroissant
+                .slice(0, 3);
+            
+            historyText = allEvents.map(e => ` - ${e.a} : ${e.z} (${e.c ? 'Loc: '+e.c : ''})`).join("\n");
         }
 
-        // 4. Préparation du contexte (Comme pour la France)
-        const resolution = {
-            data: trackingData,
-            tracking_number: cleanTracking,
-            woo_order: null // On n'a pas cherché la commande, c'est direct
-        };
+        // 3. Rédaction Robin
+        // On n'a plus besoin de "Proof Screenshot", on donne les données textuelles fiables à GPT
+        const b64Context = req.file.buffer.toString("base64");
+        
+        const systemPrompt = `
+        Tu es Robin du service après vente de Solstice Bijoux.
+        
+        CONTEXTE : Suivi International (Source: 17TRACK).
+        Numéro : ${cleanTracking}
+        Destination : ${destination}
+        
+        DONNÉES TECHNIQUES REÇUES :
+        - Dernier statut : "${statusInfo}"
+        - Historique récent :
+        ${historyText}
+        
+        TA MISSION :
+        - Explique clairement au client où est son colis.
+        - Si c'est bloqué en douane ou arrivé dans le pays de destination, précise-le.
+        - Donne le lien de suivi universel : https://t.17track.net/fr#nums=${cleanTracking}
+        
+        TON STYLE :
+        - Vouvoiement. "Bonjour [Prénom],".
+        - 1 emoji max. Signature : "Robin 🌞". Pas de tiret "—".
+        `;
 
-        const simpleContext = simplifyContext(extracted, resolution);
-
-        // 5. Rédaction Robin (Même style que France)
-        const finalText = await draftResponseWithVision(simpleContext, req.file);
+        const response = await openai.chat.completions.create({
+            model: "gpt-5",
+            messages: [
+                { role: "system", content: systemPrompt },
+                { 
+                    role: "user", 
+                    content: [
+                        { type: "text", text: "Voici la photo du colis pour le contexte (prénom sur l'étiquette)." },
+                        { type: "image_url", image_url: { url: `data:${req.file.mimetype};base64,${b64Context}` } }
+                    ] 
+                }
+            ]
+        });
 
         res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-        return res.send(finalText);
+        return res.send(response.choices[0].message.content);
 
     } catch (e) {
         console.error(e);
         res.status(500).setHeader('Content-Type', 'text/plain; charset=utf-8');
-        return res.send("Erreur technique sur le suivi international.\n\nRobin 🌞");
+        return res.send("Erreur lors de la récupération du suivi international.\n\nRobin 🌞");
     }
 });
-
 
 // ==========================================
 // ROUTE 2 : SAV GÉNÉRAL (Avec instructions)
