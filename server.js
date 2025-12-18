@@ -38,7 +38,7 @@ async function extractDataFromImage(file) {
     const dataUrl = `data:${file.mimetype};base64,${b64}`;
 
     const response = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
+      model: "gpt-5-nano",
       response_format: { type: "json_object" },
       messages: [
         {
