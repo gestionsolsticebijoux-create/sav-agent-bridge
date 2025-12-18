@@ -269,117 +269,121 @@ app.post("/sav/analyze", upload.single("image"), async (req, res) => {
 
 
 // ==========================================
-// ROUTE 3 : SAV INTERNATIONAL (EXTRACTION CIBLÉE + DEBUG)
+// ROUTE 3 : SAV INTERNATIONAL (DEBUG MODE)
 // ==========================================
 
 app.post("/sav/international", upload.single("image"), async (req, res) => {
-    let debugLogs = [];
-    const log = (msg) => {
-        console.log(`[INTL] ${msg}`);
-        debugLogs.push(msg);
-    };
-
+    console.log("--- DÉBUT REQUÊTE INTERNATIONAL ---");
     try {
-        if (!req.file) throw new Error("Image manquante");
+        if (!req.file) {
+            console.error("ERREUR: Aucune image reçue.");
+            return res.status(400).send("Erreur: Image manquante");
+        }
+        console.log(`Image reçue. Taille: ${req.file.size} bytes. Mimetype: ${req.file.mimetype}`);
 
-        log("1. Lancement extraction CIBLÉE (Tracking uniquement)...");
-        
-        // APPEL DE LA NOUVELLE FONCTION
-        const extracted = await extractTrackingSpecific(req.file);
-        
-        let rawTracking = extracted.tracking_number;
-        let firstName = extracted.first_name || "Client";
+        // 1. Extraction
+        console.log("1. Envoi de l'image à GPT pour extraction...");
+        let extracted;
+        try {
+            extracted = await extractIdentifiers(req.file);
+            console.log("DEBUG - Réponse complète Extraction GPT:", JSON.stringify(extracted, null, 2));
+        } catch (err) {
+            console.error("ERREUR CRITIQUE lors de l'extraction GPT:", err);
+            return res.status(500).send("Erreur: GPT n'a pas réussi à lire l'image. " + err.message);
+        }
 
-        log(`2. Résultat Brut IA : Tracking="${rawTracking}", Nom="${firstName}"`);
+        let trackingNumber = extracted.identifiers?.tracking_number;
+        console.log(`2. Tracking number extrait brut : "${trackingNumber}"`);
 
-        if (!rawTracking) {
+        if (!trackingNumber) {
+             console.warn("ALERTE: GPT n'a trouvé aucun tracking number.");
              res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-             return res.send("Bonjour,\n\nJe n'ai pas réussi à lire le numéro de suivi sur la photo. L'image est peut-être floue ?\n\nRobin 🌞");
+             return res.send("Bonjour,\n\nJe n'ai pas réussi à lire le numéro de suivi sur la photo. Pourriez-vous me l'écrire ?\n\nRobin 🌞");
         }
         
-        // Nettoyage forcé (Majuscules + suppression de TOUT ce qui n'est pas chiffre ou lettre)
-        const cleanTracking = rawTracking.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
-        log(`3. Numéro nettoyé pour API : "${cleanTracking}"`);
+        // Nettoyage
+        const cleanTracking = trackingNumber.replace(/\s+/g, '').toUpperCase();
+        console.log(`3. Tracking number nettoyé : "${cleanTracking}"`);
 
+        // 2. Appel API 17TRACK
         const track17Key = process.env.TRACK17_KEY;
-        if (!track17Key) throw new Error("Clé API 17TRACK manquante");
+        if (!track17Key) {
+            console.error("ERREUR CONFIG: La variable TRACK17_KEY est manquante dans le fichier .env ou les variables système.");
+            throw new Error("Missing TRACK17_KEY env var");
+        }
+        console.log("4. Clé API détectée. Envoi requête à 17TRACK...");
 
-        // --- ÉTAPE 1 : TENTATIVE D'ENREGISTREMENT ---
-        log("4. Appel 17TRACK /register...");
-        let trackResponse = await fetch("https://api.17track.net/track/v2.2/register", {
+        const trackResponse = await fetch("https://api.17track.net/track/v2.2/register", {
             method: "POST",
-            headers: { "17token": track17Key, "Content-Type": "application/json" },
-            body: JSON.stringify([{ number: cleanTracking }])
+            headers: {
+                "17token": track17Key,
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify([
+                { number: cleanTracking }
+            ])
         });
 
-        let trackData = await trackResponse.json();
-        let packageData = null;
+        console.log(`5. Statut HTTP 17TRACK: ${trackResponse.status}`);
+        const trackData = await trackResponse.json();
+        console.log("DEBUG - Réponse complète 17TRACK:", JSON.stringify(trackData, null, 2));
 
-        if (trackData?.data?.accepted?.length > 0) {
-            log("✅ Nouveau numéro enregistré avec succès.");
-            packageData = trackData.data.accepted[0];
-        } 
-        else if (trackData?.data?.rejected?.length > 0) {
-            const error = trackData.data.rejected[0].error;
-            log(`⚠️ Rejet Register : ${error.message} (Code ${error.code})`);
-
-            if (error.code === -18019901) { // Déjà enregistré
-                log("🔄 Numéro connu. Appel /gettrackinfo...");
-                const getResponse = await fetch("https://api.17track.net/track/v2.2/gettrackinfo", {
-                    method: "POST",
-                    headers: { "17token": track17Key, "Content-Type": "application/json" },
-                    body: JSON.stringify([{ number: cleanTracking }])
-                });
-                const getData = await getResponse.json();
-                if (getData?.data?.accepted?.length > 0) {
-                    log("✅ Données récupérées via gettrackinfo.");
-                    packageData = getData.data.accepted[0];
-                }
-            } else {
-                // Si l'erreur n'est pas "Déjà enregistré", c'est que le numéro est invalide (ex: il manque des chiffres)
-                 throw new Error(`Numéro invalide selon 17TRACK : ${error.message}`);
-            }
-        }
-
-        // --- PRÉPARATION RÉPONSE ROBIN ---
-        let statusInfo = "En attente de mise à jour";
-        let historyText = "Pas d'historique disponible.";
+        // Analyse de la réponse 17TRACK
+        let statusInfo = "Inconnu";
+        let historyText = "";
         let destination = "International";
 
-        if (packageData) {
-            if (packageData.recipientCountry) destination = packageData.recipientCountry;
-            
-            if (packageData.track) {
-                const t = packageData.track;
-                const latest = t.z1?.[0] || t.z0?.[0];
-                if (latest) statusInfo = latest.z;
+        // Vérification si 17TRACK a renvoyé une erreur ou des données vides
+        if (trackData.code !== 0) {
+            console.warn(`ATTENTION: API 17TRACK a renvoyé un code erreur: ${trackData.code} - ${trackData.message}`);
+            // On continue quand même, Robin improvisera, mais on log l'erreur.
+        }
 
-                const allEvents = [...(t.z0 || []), ...(t.z1 || [])]
-                    .sort((a, b) => new Date(b.a) - new Date(a.a))
-                    .slice(0, 3);
-                
-                if (allEvents.length > 0) historyText = allEvents.map(e => ` - ${e.a} : ${e.z}`).join("\n");
+        if (trackData?.data?.accepted?.length > 0) {
+            const info = trackData.data.accepted[0];
+            const trackInfo = info.track;
+            
+            const latestEvent = trackInfo.z1?.[0] || trackInfo.z0?.[0]; 
+            statusInfo = latestEvent ? latestEvent.z : "En transit (Pas d'info précise)";
+            destination = info.recipientCountry || "International";
+
+            const allEvents = [...(trackInfo.z0 || []), ...(trackInfo.z1 || [])]
+                .sort((a, b) => new Date(b.a) - new Date(a.a)) 
+                .slice(0, 3);
+            
+            historyText = allEvents.map(e => ` - ${e.a} : ${e.z} (${e.c ? 'Loc: '+e.c : ''})`).join("\n");
+            console.log(`6. Données interprétées: Dest=${destination}, Status=${statusInfo}`);
+        } else {
+            console.log("6. Aucune donnée 'accepted' renvoyée par 17TRACK (Colis peut-être non trouvé ou rejeté).");
+            if (trackData?.data?.rejected?.length > 0) {
+                 console.error("ERREUR 17TRACK: Le colis a été rejeté:", JSON.stringify(trackData.data.rejected));
             }
         }
 
-        log(`5. Génération réponse Robin (Statut: ${statusInfo})...`);
-
+        // 3. Rédaction Robin
+        console.log("7. Génération de la réponse avec Robin (GPT-5)...");
         const b64Context = req.file.buffer.toString("base64");
-        const systemPrompt = `
-        Tu es Robin de Solstice Bijoux.
         
-        INFO SUIVI 17TRACK :
-        - Numéro : ${cleanTracking}
-        - Dest : ${destination}
-        - Statut : "${statusInfo}"
-        - Historique :
+        const systemPrompt = `
+        Tu es Robin du service après vente de Solstice Bijoux.
+        
+        CONTEXTE : Suivi International (Source: 17TRACK).
+        Numéro : ${cleanTracking}
+        Destination : ${destination}
+        
+        DONNÉES TECHNIQUES REÇUES :
+        - Dernier statut : "${statusInfo}"
+        - Historique récent :
         ${historyText}
         
-        CONSIGNE :
-        - Bonjour ${firstName},
-        - Donne les infos.
-        - Lien : https://t.17track.net/fr#nums=${cleanTracking}
-        - Style : Courtois, 1 emoji max, Signature "Robin 🌞".
+        TA MISSION :
+        - Explique clairement au client où est son colis.
+        - Si c'est bloqué en douane ou arrivé dans le pays de destination, précise-le.
+        - Donne le lien de suivi universel : https://t.17track.net/fr#nums=${cleanTracking}
+        
+        TON STYLE :
+        - Vouvoiement. "Bonjour [Prénom],".
+        - 1 emoji max. Signature : "Robin 🌞". Pas de tiret "—".
         `;
 
         const response = await openai.chat.completions.create({
@@ -389,22 +393,23 @@ app.post("/sav/international", upload.single("image"), async (req, res) => {
                 { 
                     role: "user", 
                     content: [
-                        { type: "text", text: "Photo du colis :" },
+                        { type: "text", text: "Voici la photo du colis pour le contexte (prénom sur l'étiquette)." },
                         { type: "image_url", image_url: { url: `data:${req.file.mimetype};base64,${b64Context}` } }
                     ] 
                 }
             ]
         });
 
-        log("6. Succès.");
+        console.log("8. Réponse générée avec succès.");
         res.setHeader('Content-Type', 'text/plain; charset=utf-8');
         return res.send(response.choices[0].message.content);
 
     } catch (e) {
-        console.error("ERREUR:", e);
+        console.error("--- ERREUR GENERALE DANS LE CATCH ---");
+        console.error(e); // Affiche la stack trace complète
         res.status(500).setHeader('Content-Type', 'text/plain; charset=utf-8');
-        const report = `⚠️ DEBUG ERROR ⚠️\n${e.message}\n\nLOGS:\n${debugLogs.join('\n')}`;
-        return res.send(report);
+        // On renvoie l'erreur technique précise pour que tu la vois dans le raccourci iPhone si possible
+        return res.send(`Erreur technique serveur: ${e.message}\nConsultez les logs serveur pour plus de détails.\n\nRobin 🌞`);
     }
 });
 
