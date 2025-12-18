@@ -30,7 +30,7 @@ function jsonError(res, status, message, details) {
   return res.status(status).json({ ok: false, error: message, details: details ?? null });
 }
 
-// --- LOGIQUE MÉTIER EXTRAITE (POUR ÊTRE RÉUTILISÉE) ---
+// --- LOGIQUE MÉTIER ---
 
 async function extractDataFromImage(file) {
     const b64 = file.buffer.toString("base64");
@@ -74,107 +74,116 @@ async function extractDataFromImage(file) {
     return JSON.parse(text);
 }
 
+// Nouvelle logique de résolution avec logs (trace)
 async function resolveTrackingLogic(extracted) {
+    const logs = []; // On va stocker l'histoire ici
     const email = extracted?.customer?.email ?? null;
     const order_number_in = extracted?.order?.order_number ?? null;
     const tracking_in = extracted?.shipment?.tracking_number ?? null;
 
-    // 1. Si on a déjà le tracking
+    logs.push(`Début analyse. Données entrantes : Email=${email}, Order=${order_number_in}, Tracking=${tracking_in}`);
+
+    // CAS 1 : On a déjà le tracking
     if (tracking_in) {
+      logs.push("Tracking trouvé directement par l'IA. Interrogation Sendcloud...");
       const tracking = await sendcloudTrackByTrackingNumber(tracking_in);
+      logs.push(`Statut Sendcloud reçu : ${tracking?.status?.id || "inconnu"}`);
+      
       return {
-        path: "tracking_number",
-        email,
-        order_number: order_number_in,
-        tracking_number: tracking_in,
-        tracking
+        logs,
+        path: "tracking_number_direct",
+        final_status: tracking,
+        tracking_number: tracking_in
       };
     }
 
-    // 2. Si on a le numéro de commande
+    // CAS 2 : On a le numéro de commande
     if (order_number_in) {
+      logs.push(`Numéro de commande ${order_number_in} trouvé. Recherche colis Sendcloud...`);
       const parcels = await sendcloudFindParcelByOrderNumber(order_number_in);
       const tn = pickTrackingNumberFromParcelsResponse(parcels);
+      
       if (!tn) {
+        logs.push("Aucun colis/tracking trouvé dans Sendcloud pour cette commande.");
         return {
-          path: "order_number_no_tracking",
-          email,
-          order_number: order_number_in,
+          logs,
+          path: "order_number_found_but_no_parcel",
+          final_status: null,
           tracking_number: null,
-          parcels
+          parcels_debug: parcels
         };
       }
+      
+      logs.push(`Tracking ${tn} découvert via Sendcloud. Récupération statut...`);
       const tracking = await sendcloudTrackByTrackingNumber(tn);
       return {
-        path: "order_number",
-        email,
-        order_number: order_number_in,
-        tracking_number: tn,
-        parcels,
-        tracking
+        logs,
+        path: "order_number_resolved",
+        final_status: tracking,
+        tracking_number: tn
       };
     }
 
-    // 3. Si on a l'email -> WooCommerce -> Sendcloud
+    // CAS 3 : On a l'email -> WooCommerce -> Sendcloud
     if (email) {
-      const woo = await wooLookupByEmail(email);
+      logs.push(`Email ${email} trouvé. Recherche commande dans WooCommerce...`);
+      
+      // Ici on utilise la nouvelle fonction optimisée
+      const woo = await wooLookupByEmailStart(email);
+      
+      if (!woo.order_number) {
+        logs.push("WooCommerce n'a retourné aucune commande pour cet email.");
+        return {
+          logs,
+          path: "email_found_but_no_order_in_woo",
+          final_status: null,
+          tracking_number: null
+        };
+      }
+
+      logs.push(`Commande WooCommerce trouvée : #${woo.order_number}. Vérification métadonnées tracking...`);
 
       if (woo.tracking_number) {
+        logs.push(`Tracking ${woo.tracking_number} trouvé dans les métadonnées Woo. Interrogation Sendcloud...`);
         const tracking = await sendcloudTrackByTrackingNumber(woo.tracking_number);
         return {
-          path: "email->woo(tracking)",
-          email,
-          order_number: woo.order_number,
-          tracking_number: woo.tracking_number,
-          woo,
-          tracking
+          logs,
+          path: "email_resolved_via_woo_meta",
+          final_status: tracking,
+          tracking_number: woo.tracking_number
         };
       }
 
-      if (woo.order_number) {
-        const parcels = await sendcloudFindParcelByOrderNumber(woo.order_number);
-        const tn = pickTrackingNumberFromParcelsResponse(parcels);
-        if (!tn) {
-          return {
-            path: "email->woo(order)->sendcloud(no_tracking)",
-            email,
-            order_number: woo.order_number,
-            tracking_number: null,
-            woo,
-            parcels
-          };
-        }
-        const tracking = await sendcloudTrackByTrackingNumber(tn);
+      logs.push("Pas de tracking dans Woo. Recherche colis Sendcloud avec le numéro de commande...");
+      const parcels = await sendcloudFindParcelByOrderNumber(woo.order_number);
+      const tn = pickTrackingNumberFromParcelsResponse(parcels);
+
+      if (!tn) {
+        logs.push("Sendcloud ne trouve aucun colis pour ce numéro de commande.");
         return {
-          path: "email->woo(order)->sendcloud->tracking",
-          email,
-          order_number: woo.order_number,
-          tracking_number: tn,
-          woo,
-          parcels,
-          tracking
+          logs,
+          path: "email_found_order_found_but_no_parcel",
+          final_status: null,
+          tracking_number: null
         };
       }
 
+      logs.push(`Tracking ${tn} trouvé via Sendcloud. Récupération statut final...`);
+      const tracking = await sendcloudTrackByTrackingNumber(tn);
       return {
-        path: "email_no_order_found",
-        email,
-        order_number: null,
-        tracking_number: null,
-        woo
+        logs,
+        path: "email_resolved_via_sendcloud_lookup",
+        final_status: tracking,
+        tracking_number: tn
       };
     }
 
-    return { path: "no_identifiers", email: null, order_number: null, tracking_number: null };
+    logs.push("Aucune donnée exploitable (ni email, ni commande, ni tracking).");
+    return { logs, path: "no_identifiers", final_status: null, tracking_number: null };
 }
 
 // --- ROUTES ---
 
-/**
- * LA ROUTE MAGIQUE (Celle que tu dois appeler depuis Rails)
- * Entrée : Image
- * Sortie : Tracking complet
- */
 app.post("/sav/process", upload.single("image"), async (req, res) => {
   try {
     if (!req.file) return jsonError(res, 400, "missing image");
@@ -182,11 +191,11 @@ app.post("/sav/process", upload.single("image"), async (req, res) => {
     // 1. Extraction (IA)
     const extracted = await extractDataFromImage(req.file);
     
-    // 2. Résolution (Woo/Sendcloud)
+    // 2. Résolution (Woo/Sendcloud) avec Logs
     const result = await resolveTrackingLogic(extracted);
     
     // 3. Retourne tout
-    return res.json({ ok: true, extracted, result });
+    return res.json({ ok: true, extracted, resolution: result });
     
   } catch (e) {
     console.error(e);
@@ -194,42 +203,20 @@ app.post("/sav/process", upload.single("image"), async (req, res) => {
   }
 });
 
+app.get("/health", (req, res) => res.json({ ok: true }));
 
-// Ancienne route (juste pour tester l'extraction si besoin)
-app.post("/sav/extract", upload.single("image"), async (req, res) => {
-  try {
-    if (!req.file) return jsonError(res, 400, "missing image");
-    const extracted = await extractDataFromImage(req.file);
-    return res.json(extracted);
-  } catch (e) {
-    return jsonError(res, 500, "sav_extract_failed", String(e?.message || e));
-  }
-});
-
-// Ancienne route (si on veut résoudre manuellement un JSON)
-app.post("/sav/resolve", async (req, res) => {
-  try {
-    const extracted = req.body?.extracted;
-    if (!extracted) return jsonError(res, 400, "Missing extracted");
-    const result = await resolveTrackingLogic(extracted);
-    return res.json({ ok: true, ...result });
-  } catch (e) {
-    return jsonError(res, 500, "SAV resolve failed", String(e?.message || e));
-  }
-});
 
 /**
- * WooCommerce Implementation
+ * WooCommerce Implementation (OPTIMISÉE)
  */
-async function wooFetchOrdersLatest(perPage = 50) {
+async function wooFetchOrdersBySearch(term) {
   const base = requireEnv("WC_BASE_URL").replace(/\/$/, "");
   const ck = requireEnv("WC_CONSUMER_KEY");
   const cs = requireEnv("WC_CONSUMER_SECRET");
 
   const url = new URL(`${base}/wp-json/wc/v3/orders`);
-  url.searchParams.set("per_page", String(perPage));
-  url.searchParams.set("orderby", "date");
-  url.searchParams.set("order", "desc");
+  url.searchParams.set("search", term); // <-- C'est ici la magie : on cherche précisément
+  url.searchParams.set("per_page", "10"); // On limite à 10 résultats pertinents
 
   const r = await fetch(url.toString(), {
     headers: {
@@ -240,7 +227,7 @@ async function wooFetchOrdersLatest(perPage = 50) {
 
   if (!r.ok) {
     const text = await r.text().catch(() => "");
-    throw new Error(`Woo orders fetch failed: ${r.status} ${text}`);
+    throw new Error(`Woo search failed: ${r.status} ${text}`);
   }
 
   return await r.json();
@@ -268,18 +255,14 @@ function extractTrackingFromOrderMeta(order) {
   return null;
 }
 
-async function wooLookupByEmail(email) {
-  const perPage = Number(process.env.ORDER_LOOKBACK_PER_PAGE || 50);
-  const orders = await wooFetchOrdersLatest(perPage);
+// Nouvelle fonction qui cherche VRAIMENT l'email
+async function wooLookupByEmailStart(email) {
+  const orders = await wooFetchOrdersBySearch(email);
 
-  const normalized = String(email || "").trim().toLowerCase();
-  const matches = orders.filter(
-    (o) => String(o?.billing?.email || "").trim().toLowerCase() === normalized
-  );
+  if (!orders.length) return { order_number: null, order_id: null, tracking_number: null };
 
-  if (!matches.length) return { order_number: null, order_id: null, tracking_number: null };
-
-  const latest = matches[0];
+  // On prend la commande la plus récente retournée par la recherche
+  const latest = orders[0];
   const order_number = pickOrderNumber(latest);
   const order_id = latest?.id ?? null;
   const tracking_number = extractTrackingFromOrderMeta(latest);
@@ -335,45 +318,6 @@ function pickTrackingNumberFromParcelsResponse(payload) {
 
   return null;
 }
-
-/**
- * Endpoints
- */
-app.get("/health", (req, res) => res.json({ ok: true }));
-
-app.post("/woo/lookup", async (req, res) => {
-  try {
-    const email = req.body?.email;
-    if (!email) return jsonError(res, 400, "Missing email");
-    const out = await wooLookupByEmail(email);
-    return res.json({ ok: true, ...out });
-  } catch (e) {
-    return jsonError(res, 500, "Woo lookup failed", String(e?.message || e));
-  }
-});
-
-app.post("/sendcloud/by-order-number", async (req, res) => {
-  try {
-    const order_number = req.body?.order_number;
-    if (!order_number) return jsonError(res, 400, "Missing order_number");
-    const parcels = await sendcloudFindParcelByOrderNumber(order_number);
-    const tracking_number = pickTrackingNumberFromParcelsResponse(parcels);
-    return res.json({ ok: true, order_number: String(order_number), tracking_number, parcels });
-  } catch (e) {
-    return jsonError(res, 500, "Sendcloud by-order-number failed", String(e?.message || e));
-  }
-});
-
-app.post("/sendcloud/by-tracking", async (req, res) => {
-  try {
-    const tracking_number = req.body?.tracking_number;
-    if (!tracking_number) return jsonError(res, 400, "Missing tracking_number");
-    const tracking = await sendcloudTrackByTrackingNumber(tracking_number);
-    return res.json({ ok: true, tracking_number: String(tracking_number), tracking });
-  } catch (e) {
-    return jsonError(res, 500, "Sendcloud tracking failed", String(e?.message || e));
-  }
-});
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Listening on ${port}`));
