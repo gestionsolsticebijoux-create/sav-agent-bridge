@@ -27,7 +27,7 @@ function basicAuthHeader(user, pass) {
 }
 
 // ==========================================
-// ROUTE 1 : SAV TRACKING (Automatique)
+// OUTILS COMMUNS (Extraction & Clients)
 // ==========================================
 
 async function extractIdentifiers(file) {
@@ -35,7 +35,7 @@ async function extractIdentifiers(file) {
     const dataUrl = `data:${file.mimetype};base64,${b64}`;
 
     const response = await openai.chat.completions.create({
-      model: "gpt-5-nano",
+      model: "gpt-5-nano", // Extraction rapide
       response_format: { type: "json_object" },
       messages: [
         { role: "system", content: "Tu es un extracteur de données techniques." },
@@ -52,8 +52,9 @@ async function extractIdentifiers(file) {
                 '  "identifiers": { "email": null, "phone": null, "order_number": null, "tracking_number": null }',
                 "}",
                 "RÈGLES :",
-                "- Phone : Prends TOUS les chiffres (ex: 32..., 41..., 33...).",
-                "- Ne formate pas, garde la matière brute."
+                "- Tracking Number : Cherche le code-barres ou le numéro de suivi sur l'étiquette (ex: 1Z..., L..., 87...).",
+                "- Phone : Prends TOUS les chiffres.",
+                "- Prénom : Cherche sur l'étiquette d'expédition si visible."
               ].join("\n")
             },
             { type: "image_url", image_url: { url: dataUrl } }
@@ -67,6 +68,12 @@ async function extractIdentifiers(file) {
     return JSON.parse(text.substring(jsonStart, jsonEnd + 1));
 }
 
+// ... (Clients API inchangés, voir bas de fichier) ...
+
+// ==========================================
+// ROUTE 1 : SAV TRACKING FRANCE (Automatique + Check Pays)
+// ==========================================
+
 async function resolveTrackingLogic(identifiers) {
     const logs = [];
     const email = identifiers?.email ?? null;
@@ -74,7 +81,6 @@ async function resolveTrackingLogic(identifiers) {
     const order_number_in = identifiers?.order_number ?? null;
     const tracking_in = identifiers?.tracking_number ?? null;
 
-    // 1. Commande Directe
     if (order_number_in) {
       const wooOrder = await wooFetchOrderById(order_number_in);
       if (checkInternational(wooOrder)) return { isInternational: true, logs };
@@ -87,21 +93,17 @@ async function resolveTrackingLogic(identifiers) {
       }
     }
 
-    // 2. Email
     if (email) {
       const res = await tryResolveViaWooSearch(email, logs);
       if (res) return res;
     }
 
-    // 3. Téléphone (STRATÉGIE "PARALLÈLE")
     if (phone) {
       let rawDigits = phone.replace(/\D/g, ''); 
       let candidates = new Set();
-      
       candidates.add(rawDigits);
       candidates.add('+' + rawDigits);
       candidates.add('00' + rawDigits);
-
       if (rawDigits.startsWith('33') && rawDigits.length > 9) candidates.add('0' + rawDigits.substring(2));
       if (rawDigits.startsWith('0') && rawDigits.length === 10) {
           candidates.add('33' + rawDigits.substring(1));
@@ -110,21 +112,12 @@ async function resolveTrackingLogic(identifiers) {
       if (rawDigits.startsWith('32') && rawDigits.length > 8) candidates.add('0' + rawDigits.substring(2));
       if (rawDigits.startsWith('41') && rawDigits.length > 8) candidates.add('0' + rawDigits.substring(2));
 
-      logs.push(`📞 Phone Candidates (Parallel): ${Array.from(candidates).join(', ')}`);
-
-      // LANCEMENT SIMULTANÉ DE TOUTES les RECHERCHES
       const searchPromises = Array.from(candidates).map(c => tryResolveViaWooSearch(c, logs));
-      
-      // On attend que tout le monde ait fini
       const results = await Promise.all(searchPromises);
-      
-      // On cherche le premier résultat valide (qui n'est pas null)
       const validResult = results.find(r => r !== null);
-      
       if (validResult) return validResult;
     }
 
-    // 4. Tracking direct
     if (tracking_in) {
       const tracking = await sendcloudTrackByTrackingNumber(tracking_in);
       if (tracking.destination && tracking.destination !== 'FR' && tracking.destination !== 'FRANCE') {
@@ -145,25 +138,18 @@ function checkInternational(wooOrder) {
 async function tryResolveViaWooSearch(term, logs) {
     const woo = await wooLookupBySearchTerm(term);
     if (!woo.order_number) return null;
-    
-    // STOP INTERNATIONAL
-    if (woo.country && woo.country !== 'FR') {
-        return { isInternational: true, logs };
-    }
+    if (woo.country && woo.country !== 'FR') return { isInternational: true, logs };
 
     const wooOrderFull = await wooFetchOrderById(woo.order_number); 
     let tn = woo.tracking_number;
-    
     if (!tn) {
         const parcels = await sendcloudFindParcelByOrderNumber(woo.order_number);
         tn = pickTrackingNumberFromParcelsResponse(parcels);
     }
-    
     if (tn) {
         const tracking = await sendcloudTrackByTrackingNumber(tn);
         return { logs, data: tracking, tracking_number: tn, woo_order: wooOrderFull };
     }
-    
     return { logs, data: null, tracking_number: null, woo_order: wooOrderFull, status: "processing_no_tracking" };
 }
 
@@ -193,9 +179,9 @@ async function draftResponseWithVision(data, file) {
     const b64 = file.buffer.toString("base64");
     const dataUrl = `data:${file.mimetype};base64,${b64}`;
     const systemPrompt = `
-    Tu es Robin du service après vente de Solstice Bijoux (piercing).
+    Tu es Robin du service après vente de Solstice Bijoux.
     TON STYLE : Vouvoiement. "Bonjour [Prénom],". 1 emoji max. Signature : "Robin 🌞". Pas de tiret "—". Ton courtois, poli, compréhensif.
-    ADAPTATION : Analyse la plateforme (WhatsApp/Mail) pour la structure. Analyse l'émotion du client.
+    ADAPTATION : Analyse la plateforme (WhatsApp/Mail) pour la structure.
     INFO : Statut: ${data.current_status}, Lien: ${data.tracking_link}.
     `;
     let userContentText = data.is_found 
@@ -203,7 +189,7 @@ async function draftResponseWithVision(data, file) {
         : `Le client s'appelle ${data.first_name}. Commande non trouvée. Demande poliment le numéro ou l'email.`;
 
     const response = await openai.chat.completions.create({
-        model: "gpt-5",
+        model: "gpt-5", // Rédaction puissante
         messages: [
             { role: "system", content: systemPrompt },
             { role: "user", content: [{ type: "text", text: userContentText }, { type: "image_url", image_url: { url: dataUrl } }] }
@@ -237,13 +223,65 @@ app.post("/sav/analyze", upload.single("image"), async (req, res) => {
 
 
 // ==========================================
+// ROUTE 3 : SAV INTERNATIONAL (Photo Colis Direct)
+// ==========================================
+
+app.post("/sav/international", upload.single("image"), async (req, res) => {
+    try {
+        if (!req.file) return res.status(400).send("Erreur: Image manquante");
+
+        // 1. Extraction (On cherche spécifiquement le tracking sur l'étiquette)
+        const extracted = await extractIdentifiers(req.file);
+        
+        let trackingNumber = extracted.identifiers?.tracking_number;
+
+        if (!trackingNumber) {
+             res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+             return res.send("Bonjour,\n\nJe n'ai pas réussi à lire le numéro de suivi sur la photo. Pourriez-vous me l'écrire ?\n\nRobin 🌞");
+        }
+
+        // 2. Nettoyage (Suppression des espaces)
+        const cleanTracking = trackingNumber.replace(/\s+/g, '');
+
+        // 3. Appel direct Sendcloud (Pas de check Woo, c'est l'international assumé)
+        let trackingData;
+        try {
+            trackingData = await sendcloudTrackByTrackingNumber(cleanTracking);
+        } catch (e) {
+            // Si le tracking n'existe pas encore
+            trackingData = null;
+        }
+
+        // 4. Préparation du contexte (Comme pour la France)
+        const resolution = {
+            data: trackingData,
+            tracking_number: cleanTracking,
+            woo_order: null // On n'a pas cherché la commande, c'est direct
+        };
+
+        const simpleContext = simplifyContext(extracted, resolution);
+
+        // 5. Rédaction Robin (Même style que France)
+        const finalText = await draftResponseWithVision(simpleContext, req.file);
+
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+        return res.send(finalText);
+
+    } catch (e) {
+        console.error(e);
+        res.status(500).setHeader('Content-Type', 'text/plain; charset=utf-8');
+        return res.send("Erreur technique sur le suivi international.\n\nRobin 🌞");
+    }
+});
+
+
+// ==========================================
 // ROUTE 2 : SAV GÉNÉRAL (Avec instructions)
 // ==========================================
 
 app.post("/sav/general", upload.single("image"), async (req, res) => {
     try {
         if (!req.file) return res.status(400).send("Erreur: Image manquante");
-
         const instructions = req.body.instructions || "Analyse ce message et réponds de manière pertinente.";
         const b64 = req.file.buffer.toString("base64");
         const dataUrl = `data:${req.file.mimetype};base64,${b64}`;
@@ -264,14 +302,12 @@ app.post("/sav/general", upload.single("image"), async (req, res) => {
 
         res.setHeader('Content-Type', 'text/plain; charset=utf-8');
         return res.send(response.choices[0].message.content);
-
     } catch (e) {
         console.error(e);
         res.status(500).setHeader('Content-Type', 'text/plain; charset=utf-8');
         return res.send("Erreur lors de la génération de la réponse.\n\nRobin 🌞");
     }
 });
-
 
 // ==========================================
 // CLIENTS API
