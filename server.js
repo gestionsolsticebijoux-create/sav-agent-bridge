@@ -269,138 +269,158 @@ app.post("/sav/analyze", upload.single("image"), async (req, res) => {
 
 
 // ==========================================
-// ROUTE 3 : SAV INTERNATIONAL (Corrigée "Déjà Enregistré")
+// ROUTE 3 : SAV INTERNATIONAL (DEBUG MODE)
 // ==========================================
 
 app.post("/sav/international", upload.single("image"), async (req, res) => {
-    console.log("--- DÉBUT REQUÊTE INTERNATIONAL ---");
+    console.log("🔵 --- DÉBUT REQUÊTE INTERNATIONAL ---");
+    
     try {
-        if (!req.file) return res.status(400).send("Erreur: Image manquante");
+        // CHECK 1 : Image
+        if (!req.file) {
+            console.error("❌ ERREUR: Aucune image reçue dans la requête.");
+            return res.status(400).send("Erreur: Image manquante");
+        }
+        console.log(`✅ Image reçue. Taille: ${req.file.size} bytes. Mimetype: ${req.file.mimetype}`);
 
-        // 1. Extraction
-        const extracted = await extractIdentifiers(req.file);
+        // CHECK 2 : Clé API 17TRACK
+        const track17Key = process.env.TRACK17_KEY;
+        if (!track17Key) {
+            console.error("❌ ERREUR CRITIQUE: La variable TRACK17_KEY est introuvable.");
+            throw new Error("Configuration manquante : TRACK17_KEY");
+        }
+        console.log("✅ Clé API 17TRACK détectée.");
+
+        // ÉTAPE 1 : Extraction OpenAI
+        console.log("📍 ÉTAPE 1 : Envoi image à OpenAI pour extraction...");
+        let extracted;
+        try {
+            extracted = await extractIdentifiers(req.file);
+            console.log("📄 Résultat extraction brut :", JSON.stringify(extracted));
+        } catch (openaiError) {
+            console.error("❌ ERREUR OPENAI (Extraction):", openaiError);
+            // Souvent c'est le nom du modèle (gpt-5 n'existe pas encore publiquement)
+            return res.status(500).send(`Erreur OpenAI Extraction: ${openaiError.message}`);
+        }
+
         let trackingNumber = extracted.identifiers?.tracking_number;
-
+        
         if (!trackingNumber) {
+             console.warn("⚠️ ALERTE: Aucun numéro de suivi trouvé par l'IA.");
              return res.send("Bonjour,\n\nJe n'ai pas réussi à lire le numéro de suivi sur la photo. Pourriez-vous me l'écrire ?\n\nRobin 🌞");
         }
-        
-        const cleanTracking = trackingNumber.replace(/\s+/g, '').toUpperCase();
-        const track17Key = process.env.TRACK17_KEY;
-        if (!track17Key) throw new Error("Missing TRACK17_KEY env var");
 
-        // 2. TENTATIVE 1 : ENREGISTREMENT (Register)
-        console.log(`Tentative d'enregistrement du numéro : ${cleanTracking}`);
-        let trackResponse = await fetch("https://api.17track.net/track/v2.2/register", {
+        const cleanTracking = trackingNumber.replace(/\s+/g, '').toUpperCase();
+        console.log(`✅ Numéro extrait et nettoyé : "${cleanTracking}"`);
+
+        // ÉTAPE 2 : Appel 17TRACK
+        console.log("📍 ÉTAPE 2 : Appel API 17TRACK (Register)...");
+        
+        let packageInfo = null;
+        
+        const registerResponse = await fetch("https://api.17track.net/track/v2.2/register", {
             method: "POST",
             headers: { "17token": track17Key, "Content-Type": "application/json" },
             body: JSON.stringify([{ number: cleanTracking }])
         });
 
-        let trackData = await trackResponse.json();
-        let packageInfo = null;
+        const trackData = await registerResponse.json();
+        console.log("📄 Réponse 17TRACK (Register) :", JSON.stringify(trackData));
 
-        // CAS A : Nouveau numéro accepté
         if (trackData?.data?.accepted?.length > 0) {
-            console.log("-> Nouveau numéro enregistré avec succès.");
+            console.log("✅ Nouveau colis enregistré.");
             packageInfo = trackData.data.accepted[0];
         } 
-        // CAS B : Numéro rejeté (potentiellement déjà existant)
         else if (trackData?.data?.rejected?.length > 0) {
             const error = trackData.data.rejected[0].error;
-            console.log(`-> Numéro rejeté par Register. Code: ${error.code}`);
+            console.log(`⚠️ Rejeté par Register. Code: ${error.code} - Message: ${error.message}`);
 
-            // Code -18019901 = "Tracking number already registered"
             if (error.code === -18019901) {
-                console.log("-> Le numéro existe déjà. Tentative de récupération (GetTrackInfo)...");
+                console.log("📍 Le numéro existe déjà. Tentative GetTrackInfo...");
                 
-                // TENTATIVE 2 : RÉCUPÉRATION (GetTrackInfo)
                 const infoResponse = await fetch("https://api.17track.net/track/v2.2/gettrackinfo", {
                     method: "POST",
                     headers: { "17token": track17Key, "Content-Type": "application/json" },
                     body: JSON.stringify([{ number: cleanTracking }])
                 });
                 const infoData = await infoResponse.json();
+                console.log("📄 Réponse 17TRACK (GetInfo) :", JSON.stringify(infoData));
                 
                 if (infoData?.data?.accepted?.length > 0) {
                     packageInfo = infoData.data.accepted[0];
-                    console.log("-> Informations récupérées avec succès !");
+                    console.log("✅ Infos récupérées.");
                 }
             }
         }
 
-        // Si après tout ça on a toujours rien...
-        if (!packageInfo) {
-            console.error("-> Impossible de récupérer les infos (ni via Register, ni via GetTrackInfo).");
-            // On laisse Robin gérer le manque d'info, ou on renvoie une erreur
-        }
-
-        // 3. Analyse des données pour Robin
+        // Préparation données pour Robin
         let statusInfo = "En attente d'informations";
         let historyText = "Pas d'historique disponible.";
         let destination = "International";
 
         if (packageInfo && packageInfo.track) {
             const trackInfo = packageInfo.track;
-            
-            // Dernier événement (z1 = destination, z0 = origine)
             const latestEvent = trackInfo.z1?.[0] || trackInfo.z0?.[0]; 
             statusInfo = latestEvent ? latestEvent.z : "En transit";
             destination = packageInfo.recipientCountry || "International";
 
-            // Historique (Fusion z0 + z1 et Tri)
             const allEvents = [...(trackInfo.z0 || []), ...(trackInfo.z1 || [])]
                 .sort((a, b) => new Date(b.a) - new Date(a.a)) 
-                .slice(0, 5); // On prend les 5 derniers pour être sûr
+                .slice(0, 5);
             
             if (allEvents.length > 0) {
-                historyText = allEvents.map(e => ` - ${e.a} : ${e.z} (${e.c ? 'Lieu: '+e.c : ''})`).join("\n");
+                historyText = allEvents.map(e => ` - ${e.a} : ${e.z}`).join("\n");
             }
+        } else {
+            console.warn("⚠️ Aucune info de tracking trouvée, Robin va devoir improviser.");
         }
 
-        // 4. Rédaction Robin
+        // ÉTAPE 3 : Rédaction Robin
+        console.log("📍 ÉTAPE 3 : Génération de la réponse avec Robin...");
         const b64Context = req.file.buffer.toString("base64");
         const systemPrompt = `
         Tu es Robin du service après vente de Solstice Bijoux.
-        
         CONTEXTE : Suivi International (17TRACK).
         Numéro : ${cleanTracking}
         Destination : ${destination}
-        
         DONNÉES TECHNIQUES :
         - Statut Actuel : "${statusInfo}"
         - Historique :
         ${historyText}
-        
         TA MISSION :
-        - Analyse l'historique pour comprendre où est le colis (Douane ? Arrivé dans le pays ? Livré ?).
         - Rédige une réponse rassurante.
         - Donne le lien : https://t.17track.net/fr#nums=${cleanTracking}
-        
         STYLE : "Bonjour [Prénom],", Vouvoiement, 1 emoji max, Signé "Robin 🌞".
         `;
 
-        const response = await openai.chat.completions.create({
-            model: "gpt-5",
-            messages: [
-                { role: "system", content: systemPrompt },
-                { 
-                    role: "user", 
-                    content: [
-                        { type: "text", text: "Photo du colis (pour le prénom sur l'étiquette)." },
-                        { type: "image_url", image_url: { url: `data:${req.file.mimetype};base64,${b64Context}` } }
-                    ] 
-                }
-            ]
-        });
+        try {
+            const response = await openai.chat.completions.create({
+                model: "gpt-5", // ATTENTION : Si gpt-5 n'existe pas, mettre "gpt-4o"
+                messages: [
+                    { role: "system", content: systemPrompt },
+                    { 
+                        role: "user", 
+                        content: [
+                            { type: "text", text: "Photo du colis (pour le prénom)." },
+                            { type: "image_url", image_url: { url: `data:${req.file.mimetype};base64,${b64Context}` } }
+                        ] 
+                    }
+                ]
+            });
+            console.log("✅ Réponse générée.");
+            
+            res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+            return res.send(response.choices[0].message.content);
 
-        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-        return res.send(response.choices[0].message.content);
+        } catch (gptError) {
+            console.error("❌ ERREUR OPENAI (Rédaction):", gptError);
+            return res.status(500).send(`Erreur OpenAI Rédaction: ${gptError.message}`);
+        }
 
     } catch (e) {
-        console.error("ERREUR:", e);
+        console.error("💀 ERREUR GÉNÉRALE SERVEUR :", e);
         res.status(500).setHeader('Content-Type', 'text/plain; charset=utf-8');
-        return res.send("Erreur technique.\n\nRobin 🌞");
+        return res.send(`Erreur technique interne: ${e.message}`);
     }
 });
 
