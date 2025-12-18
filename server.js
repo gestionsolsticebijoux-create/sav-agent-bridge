@@ -68,7 +68,53 @@ async function extractIdentifiers(file) {
     return JSON.parse(text.substring(jsonStart, jsonEnd + 1));
 }
 
-// ... (Clients API inchangés, voir bas de fichier) ...
+// --- FONCTION SPÉCIALE : EXTRACTION TRACKING UNIQUEMENT ---
+async function extractTrackingSpecific(file) {
+    const b64 = file.buffer.toString("base64");
+    const dataUrl = `data:${file.mimetype};base64,${b64}`;
+
+    const response = await openai.chat.completions.create({
+      model: "gpt-5-nano", // Rapide et efficace pour l'OCR
+      response_format: { type: "json_object" },
+      messages: [
+        { 
+          role: "system", 
+          content: "Tu es un scanner optique spécialisé dans la lecture d'étiquettes d'expédition." 
+        },
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: [
+                "TA MISSION : Lire le Numéro de Suivi (Tracking Number) et le Prénom sur cette photo.",
+                "",
+                "JSON STRICT ATTENDU :",
+                "{",
+                '  "tracking_number": string | null, // Ex: "LA123456789FR", "1Z...", "87..."',
+                '  "first_name": string | null // Le prénom du destinataire',
+                "}",
+                "",
+                "CONSIGNES :",
+                "1. Cherche le code-barres principal ou la mention 'N° de suivi' / 'Tracking'.",
+                "2. Ignore les numéros de téléphone (+33...).",
+                "3. Si le numéro contient des espaces (ex: 'LA 123 456 FR'), supprime-les dans ta réponse.",
+                "4. Sois précis."
+              ].join("\n")
+            },
+            { type: "image_url", image_url: { url: dataUrl } }
+          ]
+        }
+      ]
+    });
+
+    const text = response.choices[0].message.content?.trim() ?? "";
+    const jsonStart = text.indexOf('{');
+    const jsonEnd = text.lastIndexOf('}');
+    if (jsonStart === -1 || jsonEnd === -1) throw new Error("Erreur lecture JSON IA");
+    
+    return JSON.parse(text.substring(jsonStart, jsonEnd + 1));
+}
 
 // ==========================================
 // ROUTE 1 : SAV TRACKING FRANCE (Automatique + Check Pays)
@@ -223,26 +269,43 @@ app.post("/sav/analyze", upload.single("image"), async (req, res) => {
 
 
 // ==========================================
-// ROUTE 3 : SAV INTERNATIONAL (via 17TRACK API - DOUBLE DÉTENTE)
+// ROUTE 3 : SAV INTERNATIONAL (EXTRACTION CIBLÉE + DEBUG)
 // ==========================================
 
 app.post("/sav/international", upload.single("image"), async (req, res) => {
+    let debugLogs = [];
+    const log = (msg) => {
+        console.log(`[INTL] ${msg}`);
+        debugLogs.push(msg);
+    };
+
     try {
-        if (!req.file) return res.status(400).send("Erreur: Image manquante");
+        if (!req.file) throw new Error("Image manquante");
 
-        const extracted = await extractIdentifiers(req.file);
-        let trackingNumber = extracted.identifiers?.tracking_number;
+        log("1. Lancement extraction CIBLÉE (Tracking uniquement)...");
+        
+        // APPEL DE LA NOUVELLE FONCTION
+        const extracted = await extractTrackingSpecific(req.file);
+        
+        let rawTracking = extracted.tracking_number;
+        let firstName = extracted.first_name || "Client";
 
-        if (!trackingNumber) {
+        log(`2. Résultat Brut IA : Tracking="${rawTracking}", Nom="${firstName}"`);
+
+        if (!rawTracking) {
              res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-             return res.send("Bonjour,\n\nJe n'ai pas réussi à lire le numéro de suivi sur la photo. Pourriez-vous me l'écrire ?\n\nRobin 🌞");
+             return res.send("Bonjour,\n\nJe n'ai pas réussi à lire le numéro de suivi sur la photo. L'image est peut-être floue ?\n\nRobin 🌞");
         }
         
-        const cleanTracking = trackingNumber.replace(/\s+/g, '').toUpperCase();
-        const track17Key = process.env.TRACK17_KEY;
-        if (!track17Key) throw new Error("Missing TRACK17_KEY env var");
+        // Nettoyage forcé (Majuscules + suppression de TOUT ce qui n'est pas chiffre ou lettre)
+        const cleanTracking = rawTracking.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+        log(`3. Numéro nettoyé pour API : "${cleanTracking}"`);
 
-        // --- ÉTAPE 1 : TENTATIVE D'ENREGISTREMENT (REGISTER) ---
+        const track17Key = process.env.TRACK17_KEY;
+        if (!track17Key) throw new Error("Clé API 17TRACK manquante");
+
+        // --- ÉTAPE 1 : TENTATIVE D'ENREGISTREMENT ---
+        log("4. Appel 17TRACK /register...");
         let trackResponse = await fetch("https://api.17track.net/track/v2.2/register", {
             method: "POST",
             headers: { "17token": track17Key, "Content-Type": "application/json" },
@@ -252,79 +315,71 @@ app.post("/sav/international", upload.single("image"), async (req, res) => {
         let trackData = await trackResponse.json();
         let packageData = null;
 
-        // Cas A : C'est un nouveau numéro (Accepted)
         if (trackData?.data?.accepted?.length > 0) {
+            log("✅ Nouveau numéro enregistré avec succès.");
             packageData = trackData.data.accepted[0];
         } 
-        // Cas B : Le numéro est déjà enregistré (Rejected avec code spécifique)
         else if (trackData?.data?.rejected?.length > 0) {
             const error = trackData.data.rejected[0].error;
-            // Code -18019901 = "Already registered"
-            if (error && error.code === -18019901) {
-                // --- ÉTAPE 2 : RÉCUPÉRATION DES INFOS (GETTRACKINFO) ---
+            log(`⚠️ Rejet Register : ${error.message} (Code ${error.code})`);
+
+            if (error.code === -18019901) { // Déjà enregistré
+                log("🔄 Numéro connu. Appel /gettrackinfo...");
                 const getResponse = await fetch("https://api.17track.net/track/v2.2/gettrackinfo", {
                     method: "POST",
                     headers: { "17token": track17Key, "Content-Type": "application/json" },
                     body: JSON.stringify([{ number: cleanTracking }])
                 });
                 const getData = await getResponse.json();
-                
                 if (getData?.data?.accepted?.length > 0) {
+                    log("✅ Données récupérées via gettrackinfo.");
                     packageData = getData.data.accepted[0];
                 }
+            } else {
+                // Si l'erreur n'est pas "Déjà enregistré", c'est que le numéro est invalide (ex: il manque des chiffres)
+                 throw new Error(`Numéro invalide selon 17TRACK : ${error.message}`);
             }
         }
 
-        // --- ANALYSE DES DONNÉES ---
-        let statusInfo = "Information non disponible pour l'instant";
-        let historyText = "Pas d'historique récent.";
+        // --- PRÉPARATION RÉPONSE ROBIN ---
+        let statusInfo = "En attente de mise à jour";
+        let historyText = "Pas d'historique disponible.";
         let destination = "International";
 
         if (packageData) {
-            // Destination
             if (packageData.recipientCountry) destination = packageData.recipientCountry;
             
-            // Infos de suivi (Track Object)
             if (packageData.track) {
-                const trackInfo = packageData.track;
-                const latestEvent = trackInfo.z1?.[0] || trackInfo.z0?.[0]; // z1=dest, z0=origin
-                
-                if (latestEvent) statusInfo = latestEvent.z;
+                const t = packageData.track;
+                const latest = t.z1?.[0] || t.z0?.[0];
+                if (latest) statusInfo = latest.z;
 
-                // Historique (Fusion Origin + Dest et tri par date)
-                const allEvents = [...(trackInfo.z0 || []), ...(trackInfo.z1 || [])]
+                const allEvents = [...(t.z0 || []), ...(t.z1 || [])]
                     .sort((a, b) => new Date(b.a) - new Date(a.a))
                     .slice(0, 3);
                 
-                if (allEvents.length > 0) {
-                    historyText = allEvents.map(e => ` - ${e.a} : ${e.z}`).join("\n");
-                }
-            } else {
-                statusInfo = "Numéro enregistré, en attente de synchro transporteur.";
+                if (allEvents.length > 0) historyText = allEvents.map(e => ` - ${e.a} : ${e.z}`).join("\n");
             }
         }
 
-        // --- RÉDACTION ROBIN ---
+        log(`5. Génération réponse Robin (Statut: ${statusInfo})...`);
+
         const b64Context = req.file.buffer.toString("base64");
-        
         const systemPrompt = `
-        Tu es Robin du service après vente de Solstice Bijoux.
+        Tu es Robin de Solstice Bijoux.
         
-        CONTEXTE : Suivi International (17TRACK).
-        Numéro : ${cleanTracking}
-        Destination : ${destination}
-        
-        DONNÉES TECHNIQUES :
+        INFO SUIVI 17TRACK :
+        - Numéro : ${cleanTracking}
+        - Dest : ${destination}
         - Statut : "${statusInfo}"
         - Historique :
         ${historyText}
         
         CONSIGNE :
-        - Donne les infos clairement.
+        - Bonjour ${firstName},
+        - Donne les infos.
         - Lien : https://t.17track.net/fr#nums=${cleanTracking}
-        
-        STYLE :
-        - Vouvoiement, "Bonjour [Prénom],", 1 emoji max, Signature "Robin 🌞".
+        - Style : Courtois, 1 emoji max, Signature "Robin 🌞".
         `;
 
         const response = await openai.chat.completions.create({
@@ -341,13 +396,15 @@ app.post("/sav/international", upload.single("image"), async (req, res) => {
             ]
         });
 
+        log("6. Succès.");
         res.setHeader('Content-Type', 'text/plain; charset=utf-8');
         return res.send(response.choices[0].message.content);
 
     } catch (e) {
-        console.error(e);
+        console.error("ERREUR:", e);
         res.status(500).setHeader('Content-Type', 'text/plain; charset=utf-8');
-        return res.send("Erreur technique suivi international.\n\nRobin 🌞");
+        const report = `⚠️ DEBUG ERROR ⚠️\n${e.message}\n\nLOGS:\n${debugLogs.join('\n')}`;
+        return res.send(report);
     }
 });
 
