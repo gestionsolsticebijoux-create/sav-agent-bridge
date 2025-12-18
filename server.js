@@ -1,10 +1,16 @@
 ﻿import express from "express";
 import multer from "multer";
+import OpenAI from "openai";
 
 const app = express();
-const upload = multer({ storage: multer.memoryStorage() });
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 8 * 1024 * 1024 }
+});
 
 app.use(express.json({ limit: "2mb" }));
+
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 /**
  * Helpers
@@ -25,6 +31,60 @@ function jsonError(res, status, message, details) {
 }
 
 /**
+ * SAV Extract (image -> JSON)
+ */
+app.post("/sav/extract", upload.single("image"), async (req, res) => {
+  try {
+    if (!req.file) return jsonError(res, 400, "missing image");
+
+    const b64 = req.file.buffer.toString("base64");
+    const dataUrl = `data:${req.file.mimetype};base64,${b64}`;
+
+    const response = await openai.responses.create({
+      model: "gpt-5-nano",
+      input: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text: [
+                "Tu es un extracteur d’informations SAV.",
+                "Entrée: une capture d’écran d’un email SAV.",
+                "Retourne UNIQUEMENT un JSON valide avec ce schéma:",
+                "{",
+                '  "customer": { "email": null },',
+                '  "order": { "order_number": null },',
+                '  "shipment": { "tracking_number": null },',
+                '  "signals": { "best_key": null, "has_enough": false }',
+                "}",
+                "Règles:",
+                "- N’invente rien. Si absent ou incertain: null.",
+                "- best_key = tracking_number si tracking_number non-null, sinon order_number, sinon email, sinon null.",
+                "- has_enough = true si best_key != null, sinon false.",
+                "Ne renvoie aucun texte hors JSON."
+              ].join("\n")
+            },
+            { type: "input_image", image_url: dataUrl }
+          ]
+        }
+      ]
+    });
+
+    const text = response.output_text?.trim() ?? "";
+    let parsed;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      return jsonError(res, 502, "model_did_not_return_json", text.slice(0, 800));
+    }
+    return res.json(parsed);
+  } catch (e) {
+    return jsonError(res, 500, "sav_extract_failed", String(e?.message || e));
+  }
+});
+
+/**
  * WooCommerce
  */
 async function wooFetchOrdersLatest(perPage = 50) {
@@ -32,8 +92,6 @@ async function wooFetchOrdersLatest(perPage = 50) {
   const ck = requireEnv("WC_CONSUMER_KEY");
   const cs = requireEnv("WC_CONSUMER_SECRET");
 
-  // NOTE: On évite d’affirmer l’existence d’un filtre officiel "billing_email".
-  // On récupère les dernières commandes puis on filtre strictement côté serveur.
   const url = new URL(`${base}/wp-json/wc/v3/orders`);
   url.searchParams.set("per_page", String(perPage));
   url.searchParams.set("orderby", "date");
@@ -41,8 +99,8 @@ async function wooFetchOrdersLatest(perPage = 50) {
 
   const r = await fetch(url.toString(), {
     headers: {
-      "Authorization": basicAuthHeader(ck, cs),
-      "Accept": "application/json"
+      Authorization: basicAuthHeader(ck, cs),
+      Accept: "application/json"
     }
   });
 
@@ -55,25 +113,22 @@ async function wooFetchOrdersLatest(perPage = 50) {
 }
 
 function pickOrderNumber(order) {
-  // Woo REST renvoie typiquement "number" (string) + "id" (int).
-  // On préfère "number" si présent, sinon fallback sur "id".
   if (order && order.number != null) return String(order.number);
   if (order && order.id != null) return String(order.id);
   return null;
 }
 
 function extractTrackingFromOrderMeta(order) {
-  // Pas standard WooCommerce => dépend d’un plugin.
-  // On ne devine pas : on ne cherche que dans une liste explicite de clés meta.
   const keys = (process.env.TRACKING_META_KEYS || "")
     .split(",")
-    .map(s => s.trim())
+    .map((s) => s.trim())
     .filter(Boolean);
 
   if (!keys.length) return null;
+
   const meta = Array.isArray(order?.meta_data) ? order.meta_data : [];
   for (const k of keys) {
-    const hit = meta.find(m => m?.key === k && m?.value != null && String(m.value).trim() !== "");
+    const hit = meta.find((m) => m?.key === k && m?.value != null && String(m.value).trim() !== "");
     if (hit) return String(hit.value).trim();
   }
   return null;
@@ -84,7 +139,9 @@ async function wooLookupByEmail(email) {
   const orders = await wooFetchOrdersLatest(perPage);
 
   const normalized = String(email || "").trim().toLowerCase();
-  const matches = orders.filter(o => String(o?.billing?.email || "").trim().toLowerCase() === normalized);
+  const matches = orders.filter(
+    (o) => String(o?.billing?.email || "").trim().toLowerCase() === normalized
+  );
 
   if (!matches.length) return { order_number: null, order_id: null, tracking_number: null };
 
@@ -106,8 +163,8 @@ async function sendcloudGet(path) {
   const url = `https://panel.sendcloud.sc${path}`;
   const r = await fetch(url, {
     headers: {
-      "Authorization": basicAuthHeader(pub, sec),
-      "Accept": "application/json"
+      Authorization: basicAuthHeader(pub, sec),
+      Accept: "application/json"
     }
   });
 
@@ -120,32 +177,28 @@ async function sendcloudGet(path) {
 
 async function sendcloudFindParcelByOrderNumber(order_number) {
   const q = encodeURIComponent(String(order_number));
-  // Doc: GET /api/v2/parcels?order_number=... :contentReference[oaicite:4]{index=4}
   return await sendcloudGet(`/api/v2/parcels?order_number=${q}`);
 }
 
 async function sendcloudTrackByTrackingNumber(tracking_number) {
   const tn = encodeURIComponent(String(tracking_number));
-  // Doc: GET /api/v2/tracking/{tracking_number} :contentReference[oaicite:5]{index=5}
   return await sendcloudGet(`/api/v2/tracking/${tn}`);
 }
 
 function pickTrackingNumberFromParcelsResponse(payload) {
-  // Sendcloud peut renvoyer une liste; on fait une lecture défensive.
-  // On ne devine pas : on cherche un champ "tracking_number" dans la première entrée plausible.
+  // Correction: ton code avait un bug de priorité avec "?:".
+  // Ici on choisit explicitement la première liste plausible.
   const candidates =
-    payload?.parcels ||
-    payload?.results ||
-    payload?.data ||
-    payload?.parcel ? [payload.parcel] : null;
+    payload?.parcels ??
+    payload?.results ??
+    payload?.data ??
+    (payload?.parcel ? [payload.parcel] : []);
 
   const list = Array.isArray(candidates) ? candidates : [];
   if (!list.length) return null;
 
   const first = list[0];
   if (first?.tracking_number) return String(first.tracking_number);
-
-  // Certains payloads embed un objet "tracking".
   if (first?.tracking?.tracking_number) return String(first.tracking.tracking_number);
 
   return null;
@@ -190,15 +243,6 @@ app.post("/sendcloud/by-tracking", async (req, res) => {
   }
 });
 
-/**
- * /sav/resolve
- * Entrée possible:
- * - JSON { extracted: { customer:{email}, order:{order_number}, shipment:{tracking_number}, signals:{best_key}} }
- * - ou multipart form-data avec champ "image" (si tu veux que ce endpoint appelle ton /sav/extract existant)
- *
- * Ici, je fournis la version JSON-only (zéro dépendance sur ton code existant).
- * Tu peux ensuite faire appeler /sav/extract en amont (iPhone) et passer son JSON ici.
- */
 app.post("/sav/resolve", async (req, res) => {
   try {
     const extracted = req.body?.extracted;
@@ -208,24 +252,43 @@ app.post("/sav/resolve", async (req, res) => {
     const order_number_in = extracted?.order?.order_number ?? null;
     const tracking_in = extracted?.shipment?.tracking_number ?? null;
 
-    // 1) Si tracking => tracking direct
     if (tracking_in) {
       const tracking = await sendcloudTrackByTrackingNumber(tracking_in);
-      return res.json({ ok: true, path: "tracking_number", email, order_number: order_number_in, tracking_number: tracking_in, tracking });
+      return res.json({
+        ok: true,
+        path: "tracking_number",
+        email,
+        order_number: order_number_in,
+        tracking_number: tracking_in,
+        tracking
+      });
     }
 
-    // 2) Si order_number => parcels -> tracking -> tracking detail
     if (order_number_in) {
       const parcels = await sendcloudFindParcelByOrderNumber(order_number_in);
       const tn = pickTrackingNumberFromParcelsResponse(parcels);
       if (!tn) {
-        return res.json({ ok: true, path: "order_number_no_tracking", email, order_number: order_number_in, tracking_number: null, parcels });
+        return res.json({
+          ok: true,
+          path: "order_number_no_tracking",
+          email,
+          order_number: order_number_in,
+          tracking_number: null,
+          parcels
+        });
       }
       const tracking = await sendcloudTrackByTrackingNumber(tn);
-      return res.json({ ok: true, path: "order_number", email, order_number: order_number_in, tracking_number: tn, parcels, tracking });
+      return res.json({
+        ok: true,
+        path: "order_number",
+        email,
+        order_number: order_number_in,
+        tracking_number: tn,
+        parcels,
+        tracking
+      });
     }
 
-    // 3) Sinon email => Woo lookup => (tracking via meta ou order_number => sendcloud)
     if (email) {
       const woo = await wooLookupByEmail(email);
 
@@ -269,7 +332,14 @@ app.post("/sav/resolve", async (req, res) => {
         });
       }
 
-      return res.json({ ok: true, path: "email_no_order_found", email, order_number: null, tracking_number: null, woo });
+      return res.json({
+        ok: true,
+        path: "email_no_order_found",
+        email,
+        order_number: null,
+        tracking_number: null,
+        woo
+      });
     }
 
     return res.json({ ok: true, path: "no_identifiers", email: null, order_number: null, tracking_number: null });
