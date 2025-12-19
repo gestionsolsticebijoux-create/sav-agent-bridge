@@ -1,28 +1,26 @@
-﻿import "dotenv/config"; // INDISPENSABLE pour charger les variables .env
+﻿import "dotenv/config";
 import express from "express";
 import multer from "multer";
 import OpenAI from "openai";
 
 // ==========================================
-// 1. CONFIGURATION & SÉCURITÉ
+// 1. CONFIGURATION
 // ==========================================
 
-// Vérifications de sécurité au démarrage
 if (!process.env.OPENAI_API_KEY) {
     console.error("❌ ERREUR FATALE : OPENAI_API_KEY manquante.");
     process.exit(1);
 }
 if (!process.env.TRACK17_KEY) {
-    console.error("⚠️ ATTENTION : TRACK17_KEY manquante. Le suivi international ne fonctionnera pas.");
+    console.error("⚠️ ATTENTION : TRACK17_KEY manquante.");
 }
 
 const app = express();
 
-// Configuration Express pour accepter les gros payloads (Base64)
+// Augmentation des limites pour les images Base64
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 
-// Configuration Multer (Upload images)
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 15 * 1024 * 1024 } // 15 Mo
@@ -31,7 +29,7 @@ const upload = multer({
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 // ==========================================
-// 2. HELPERS (OUTILS)
+// 2. HELPERS
 // ==========================================
 
 function requireEnv(name) {
@@ -45,12 +43,10 @@ function basicAuthHeader(user, pass) {
   return `Basic ${token}`;
 }
 
-// Helper pour parser proprement la réponse 17Track
 function parseTrackInfo(info) {
     const dest = info.recipientCountry || "International";
     const track = info.track;
     
-    // Sécurité : si track est null (pas encore d'info)
     if (!track) {
         return { 
             dest, 
@@ -62,11 +58,9 @@ function parseTrackInfo(info) {
     let status = "En transit";
     let history = "";
 
-    // Dernier événement (z0 = origine, z1 = destination)
     const latest = track.z1?.[0] || track.z0?.[0];
     if (latest && latest.z) status = latest.z;
 
-    // Historique (3 derniers événements)
     const allEvents = [...(track.z0 || []), ...(track.z1 || [])]
         .sort((a, b) => new Date(b.a) - new Date(a.a))
         .slice(0, 3);
@@ -78,16 +72,16 @@ function parseTrackInfo(info) {
 }
 
 // ==========================================
-// 3. FONCTIONS MÉTIER (LOGIQUE)
+// 3. EXTRACTION (Modèle: gpt-5-nano)
 // ==========================================
 
-// Extraction Vision (Utilisée par Route 1 et 2A)
 async function extractIdentifiers(file) {
     const b64 = file.buffer.toString("base64");
     const dataUrl = `data:${file.mimetype};base64,${b64}`;
 
+    // UTILISATION DE GPT-5-NANO (Extraction Rapide)
     const response = await openai.chat.completions.create({
-      model: "gpt-4o", 
+      model: "gpt-5-nano", 
       response_format: { type: "json_object" },
       messages: [
         { role: "system", content: "Tu es un extracteur de données techniques." },
@@ -120,7 +114,6 @@ async function extractIdentifiers(file) {
     return JSON.parse(text.substring(jsonStart, jsonEnd + 1));
 }
 
-// Logique de résolution (WooCommerce -> Sendcloud -> Pays)
 async function resolveTrackingLogic(identifiers) {
     const logs = [];
     const email = identifiers?.email ?? null;
@@ -235,8 +228,9 @@ async function draftResponseWithVision(data, file) {
         ? `Le client s'appelle ${data.first_name}. Commande trouvée ! Donne le statut et le lien.` 
         : `Le client s'appelle ${data.first_name}. Commande non trouvée. Demande poliment le numéro ou l'email.`;
 
+    // UTILISATION DE GPT-5 (Rédaction Intelligente)
     const response = await openai.chat.completions.create({
-        model: "gpt-4o",
+        model: "gpt-5",
         messages: [
             { role: "system", content: systemPrompt },
             { role: "user", content: [{ type: "text", text: userContentText }, { type: "image_url", image_url: { url: dataUrl } }] }
@@ -246,7 +240,7 @@ async function draftResponseWithVision(data, file) {
 }
 
 // ==========================================
-// ROUTE 1 : SAV TRACKING FRANCE (Legacy)
+// ROUTE 1 : SAV FRANCE (Legacy)
 // ==========================================
 
 app.post("/sav/analyze", upload.single("image"), async (req, res) => {
@@ -272,25 +266,22 @@ app.post("/sav/analyze", upload.single("image"), async (req, res) => {
   }
 });
 
-
 // ==========================================
-// ROUTE 2-A : EXTRACTION PURE (Image -> Texte)
+// ROUTE 2-A : EXTRACTION PURE (/sav/extract)
 // ==========================================
 
 app.post("/sav/extract", upload.single("image"), async (req, res) => {
     console.log("\n🔵 [ROUTE /sav/extract] Début extraction...");
     
     try {
-        if (!req.file) {
-            console.error("❌ ERREUR: Aucune image reçue.");
-            return res.status(400).send("Erreur: Image manquante");
-        }
+        if (!req.file) return res.status(400).send("Erreur: Image manquante");
 
         const b64 = req.file.buffer.toString("base64");
         const dataUrl = `data:${req.file.mimetype};base64,${b64}`;
 
+        // UTILISATION DE GPT-5-NANO (Extraction Rapide & Robuste)
         const response = await openai.chat.completions.create({
-            model: "gpt-4o", // Modèle robuste pour la rotation
+            model: "gpt-5-nano",
             response_format: { type: "json_object" },
             messages: [
                 { role: "system", content: "Tu es un lecteur optique de précision." },
@@ -317,9 +308,7 @@ app.post("/sav/extract", upload.single("image"), async (req, res) => {
             return res.status(404).send("NON_TROUVE");
         }
 
-        // Nettoyage : On ne garde que les chiffres et lettres majuscules
         const cleanTracking = trackingNumber.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
-        
         console.log(`✅ Numéro trouvé et nettoyé : ${cleanTracking}`);
         
         res.setHeader('Content-Type', 'text/plain; charset=utf-8');
@@ -331,11 +320,9 @@ app.post("/sav/extract", upload.single("image"), async (req, res) => {
     }
 });
 
-
 // ==========================================
-// ROUTE 2-B : RÉPONSE SAV INTERNATIONAL
+// ROUTE 2-B : RÉPONSE SAV INTERNATIONAL (/sav/respond)
 // ==========================================
-// 
 
 app.post("/sav/respond", upload.single("image"), async (req, res) => {
     console.log("\n🔵 [ROUTE /sav/respond] Début analyse 17TRACK...");
@@ -351,7 +338,6 @@ app.post("/sav/respond", upload.single("image"), async (req, res) => {
         console.log(`1. Tracking reçu : ${trackingNumber}`);
         console.log("2. Appel API 17TRACK...");
 
-        // APPEL 17TRACK
         const trackResponse = await fetch("https://api.17track.net/track/v2.2/register", {
             method: "POST",
             headers: {
@@ -367,30 +353,22 @@ app.post("/sav/respond", upload.single("image"), async (req, res) => {
         let historyText = "Pas d'historique disponible.";
         let destination = "International";
 
-        // --- LOGIQUE DE RÉCUPÉRATION ROBUSTE ---
-
         if (trackData?.data?.accepted?.length > 0) {
-            // CAS 1 : Enregistrement réussi, on parse direct
             const result = parseTrackInfo(trackData.data.accepted[0]);
             destination = result.dest;
             statusInfo = result.status;
             historyText = result.history;
         } 
         else if (trackData?.data?.rejected?.length > 0) {
-            // CAS 2 : Rejeté. Souvent car "déjà existant" (-18019901)
             const error = trackData.data.rejected[0].error;
-            
             if (error.code === -18019901) {
                 console.log("📍 Colis déjà suivi, appel endpoint 'gettrackinfo'...");
-                
                 const infoResponse = await fetch("https://api.17track.net/track/v2.2/gettrackinfo", {
                     method: "POST",
                     headers: { "17token": process.env.TRACK17_KEY, "Content-Type": "application/json" },
                     body: JSON.stringify([{ number: trackingNumber }])
                 });
-                
                 const infoData = await infoResponse.json();
-                
                 if (infoData?.data?.accepted?.length > 0) {
                     const result = parseTrackInfo(infoData.data.accepted[0]);
                     destination = result.dest;
@@ -398,15 +376,14 @@ app.post("/sav/respond", upload.single("image"), async (req, res) => {
                     historyText = result.history;
                 }
             } else {
-                console.warn(`⚠️ Rejeté par 17Track (Autre raison): ${error.message}`);
                 statusInfo = "Numéro non reconnu ou incorrect.";
             }
         }
         
         console.log(`3. Infos récupérées : Dest=${destination}, Status=${statusInfo}`);
 
-        // --- RÉDACTION ROBIN ---
-        console.log("4. Rédaction par Robin...");
+        // UTILISATION DE GPT-5 (Rédaction Robin)
+        console.log("4. Rédaction par Robin (GPT-5)...");
         
         let messagesPayload = [
             { role: "system", content: `Tu es Robin (SAV Solstice Bijoux). 
@@ -422,7 +399,6 @@ app.post("/sav/respond", upload.single("image"), async (req, res) => {
             }
         ];
 
-        // Ajout de l'image contextuelle (conversation WhatsApp)
         if (req.file) {
             const b64 = req.file.buffer.toString("base64");
             messagesPayload.push({
@@ -437,12 +413,11 @@ app.post("/sav/respond", upload.single("image"), async (req, res) => {
         }
 
         const gptResponse = await openai.chat.completions.create({
-            model: "gpt-4o",
+            model: "gpt-5",
             messages: messagesPayload
         });
 
         console.log("✅ Réponse générée.");
-        
         res.setHeader('Content-Type', 'text/plain; charset=utf-8');
         return res.send(gptResponse.choices[0].message.content);
 
@@ -452,9 +427,8 @@ app.post("/sav/respond", upload.single("image"), async (req, res) => {
     }
 });
 
-
 // ==========================================
-// ROUTE 4 : SAV GÉNÉRAL (Instructions libres)
+// ROUTE 4 : SAV GÉNÉRAL (/sav/general)
 // ==========================================
 
 app.post("/sav/general", upload.single("image"), async (req, res) => {
@@ -470,8 +444,9 @@ app.post("/sav/general", upload.single("image"), async (req, res) => {
         OBJECTIF: Répondre selon les instructions : "${instructions}"
         `;
 
+        // UTILISATION DE GPT-5 (Rédaction Générale)
         const response = await openai.chat.completions.create({
-            model: "gpt-4o",
+            model: "gpt-5",
             messages: [
                 { role: "system", content: systemPrompt },
                 { role: "user", content: [{ type: "image_url", image_url: { url: dataUrl } }] }
@@ -487,12 +462,11 @@ app.post("/sav/general", upload.single("image"), async (req, res) => {
     }
 });
 
-
 // ==========================================
-// CLIENTS API (WooCommerce & Sendcloud)
+// CLIENTS API
 // ==========================================
 
-async function wooFetchOrdersBySearch(term) {
+async function wooFetchOrdersBySearch(term) { /* ... Code existant inchangé ... */
   const base = requireEnv("WC_BASE_URL").replace(/\/$/, "");
   const ck = requireEnv("WC_CONSUMER_KEY");
   const cs = requireEnv("WC_CONSUMER_SECRET");
@@ -503,8 +477,7 @@ async function wooFetchOrdersBySearch(term) {
   if (!r.ok) return [];
   return await r.json();
 }
-
-async function wooFetchOrderById(id) {
+async function wooFetchOrderById(id) { /* ... Code existant inchangé ... */
     const base = requireEnv("WC_BASE_URL").replace(/\/$/, "");
     const ck = requireEnv("WC_CONSUMER_KEY");
     const cs = requireEnv("WC_CONSUMER_SECRET");
@@ -512,8 +485,7 @@ async function wooFetchOrderById(id) {
     if (!r.ok) return null;
     return await r.json();
 }
-
-async function wooLookupBySearchTerm(term) {
+async function wooLookupBySearchTerm(term) { /* ... Code existant inchangé ... */
   const orders = await wooFetchOrdersBySearch(term);
   if (!orders || !orders.length) return { order_number: null };
   const latest = orders[0];
@@ -527,25 +499,21 @@ async function wooLookupBySearchTerm(term) {
   const country = latest.shipping?.country || latest.billing?.country || "FR";
   return { order_number: latest.id, tracking_number: tn, country: country };
 }
-
-async function sendcloudGet(path) {
+async function sendcloudGet(path) { /* ... Code existant inchangé ... */
   const pub = requireEnv("SENDCLOUD_PUBLIC_KEY");
   const sec = requireEnv("SENDCLOUD_SECRET_KEY");
   const r = await fetch(`https://panel.sendcloud.sc${path}`, { headers: { Authorization: basicAuthHeader(pub, sec) } });
   if (!r.ok) throw new Error(`Sendcloud error: ${r.status}`);
   return await r.json();
 }
-
 async function sendcloudFindParcelByOrderNumber(order_number) {
   const q = encodeURIComponent(String(order_number));
   return await sendcloudGet(`/api/v2/parcels?order_number=${q}`);
 }
-
 async function sendcloudTrackByTrackingNumber(tn) {
     const q = encodeURIComponent(String(tn));
     return await sendcloudGet(`/api/v2/tracking/${q}`);
 }
-
 function pickTrackingNumberFromParcelsResponse(payload) {
   const candidates = payload?.parcels ?? payload?.results ?? payload?.data ?? (payload?.parcel ? [payload.parcel] : []);
   const list = Array.isArray(candidates) ? candidates : [];
@@ -557,4 +525,8 @@ function pickTrackingNumberFromParcelsResponse(payload) {
 app.get("/health", (req, res) => res.json({ ok: true }));
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`Listening on ${port}`));
+const server = app.listen(port, () => console.log(`Listening on ${port}`));
+
+// 🛑 ANTI-TIMEOUT
+server.keepAliveTimeout = 300 * 1000; 
+server.headersTimeout = 305 * 1000;
