@@ -2,6 +2,7 @@
 import express from "express";
 import multer from "multer";
 import OpenAI from "openai";
+import { Agent, Runner, fileSearchTool } from "@openai/agents";
 
 // ==========================================
 // 1. CONFIGURATION
@@ -471,7 +472,7 @@ app.post("/sav/respond", upload.single("image"), async (req, res) => {
 
             Action obligatoire
             Inclure systématiquement ce lien de suivi à la fin du message :
-            https://t.17track.net/fr#nums=${trackingNumber}
+            https://www.laposte.fr/outils/suivre-vos-envois?code=${trackingNumber}
 
             Signature obligatoire
             Robin 🌞` 
@@ -537,6 +538,54 @@ app.post("/sav/general", upload.single("image"), async (req, res) => {
         console.error(e);
         res.status(500).setHeader('Content-Type', 'text/plain; charset=utf-8');
         return res.send("Erreur lors de la génération de la réponse.\n\nRobin 🌞");
+    }
+});
+
+// ==========================================
+// ROUTE 5 : SOURCES TOP 10 (Via Agent SDK / ChatKit)
+// ==========================================
+
+// Définition de l'agent (en dehors de la route pour ne pas le recréer à chaque fois)
+const fileSearch = fileSearchTool([
+  "vs_683509789cd88191ba2b8df16ccfc987" // Ton Vector Store ID
+]);
+
+const sourcesAgent = new Agent({
+  name: "sources",
+  instructions: `
+    Tu es un expert en curation de contenu business.
+    Objectif : Sélectionner 5 vidéos pertinentes du VectorStore par rapport au texte utilisateur.
+    Format : Liste à puces uniquement. 5 liens. Pas de blabla.
+  `,
+  model: "gpt-4o", // Remplace "gpt-5.2" si tu n'y as pas accès, sinon garde-le
+  tools: [fileSearch],
+});
+
+app.post("/sources/top10", upload.none(), async (req, res) => {
+    console.log("\n🔵 [ROUTE /sources/top10] Demande via Agent SDK...");
+
+    try {
+        const userText = req.body.text;
+        if (!userText) return res.status(400).json({ error: "Texte manquant" });
+
+        // On instancie le Runner
+        const runner = new Runner({
+            agent: sourcesAgent,
+            inputs: [{ role: "user", content: userText }],
+        });
+
+        // On lance l'exécution
+        const result = await runner.run();
+
+        // On récupère la réponse finale
+        const finalOutput = result.finalOutput;
+
+        console.log("✅ Réponse Agent SDK reçue.");
+        res.json({ result: finalOutput });
+
+    } catch (e) {
+        console.error("❌ ERREUR AGENT SDK :", e);
+        res.status(500).json({ error: e.message });
     }
 });
 
