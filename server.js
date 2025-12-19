@@ -542,57 +542,63 @@ app.post("/sav/general", upload.single("image"), async (req, res) => {
 });
 
 // ==========================================
-// ROUTE 5 : SOURCES TOP 10 (Via Agent SDK / ChatKit)
+// ROUTE 5 : SOURCES TOP 10 (Version Stable - API Assistants)
 // ==========================================
 
-// Définition de l'agent (en dehors de la route pour ne pas le recréer à chaque fois)
-const fileSearch = fileSearchTool([
-  "vs_683509789cd88191ba2b8df16ccfc987" // Ton Vector Store ID
-]);
-
-const sourcesAgent = new Agent({
-  name: "sources",
-  instructions: `
-    Tu es un expert en curation de contenu business disposant d'un accès à une base de connaissances vidéo (VectorStore). 
-
-    Objectif : À partir du contexte et des challenges que l'utilisateur va te décrire dans son message, tu dois sélectionner exactement 5 vidéos pertinentes issues de ton VectorStore. 
-
-    Règles strictes :
-    Utilise l'outil file_search pour trouver les contenus dans le VectorStore associé.
-    Donne exactement 5 liens, ni plus, ni moins.
-    Pas de blabla, pas d'intro, pas de conclusion. Uniquement une liste à puces.
-    Structure d'une puce : Une phrase percutante (max 2 lignes) expliquant la valeur + Le lien URL.
-    Langue : Français.
-  `,
-  model: "gpt-5.2", // Remplace "gpt-5.2" si tu n'y as pas accès, sinon garde-le
-  tools: [fileSearch],
-});
-
 app.post("/sources/top10", upload.none(), async (req, res) => {
-    console.log("\n🔵 [ROUTE /sources/top10] Demande via Agent SDK...");
+    console.log("\n🔵 [ROUTE /sources/top10] Demande via API Standard...");
 
     try {
+        // 1. Récupération du texte
         const userText = req.body.text;
-        if (!userText) return res.status(400).json({ error: "Texte manquant" });
+        if (!userText) {
+            return res.status(400).json({ error: "Texte manquant" });
+        }
 
-        // On instancie le Runner
-        const runner = new Runner({
-            agent: sourcesAgent,
-            inputs: [{ role: "user", content: userText }],
+        // 2. Vérification de l'ID
+        const assistantId = process.env.SOURCES_ASSISTANT_ID;
+        if (!assistantId) {
+            console.error("❌ Variable SOURCES_ASSISTANT_ID manquante.");
+            return res.status(500).json({ error: "Config serveur manquante" });
+        }
+
+        // 3. Création du Thread
+        const thread = await openai.beta.threads.create();
+
+        // 4. Ajout du message utilisateur
+        await openai.beta.threads.messages.create(thread.id, {
+            role: "user",
+            content: userText
         });
 
-        // On lance l'exécution
-        const result = await runner.run();
+        console.log(`⏳ Lancement du Run sur l'assistant ${assistantId}...`);
 
-        // On récupère la réponse finale
-        const finalOutput = result.finalOutput;
+        // 5. Exécution et attente de la réponse (Polling automatique)
+        const run = await openai.beta.threads.runs.createAndPoll(thread.id, {
+            assistant_id: assistantId,
+        });
 
-        console.log("✅ Réponse Agent SDK reçue.");
-        res.json({ result: finalOutput });
+        // 6. Traitement du résultat
+        if (run.status === 'completed') {
+            const messages = await openai.beta.threads.messages.list(thread.id);
+            
+            // Le dernier message de l'assistant
+            const lastMessage = messages.data.find(m => m.role === 'assistant');
+            let responseText = lastMessage?.content?.[0]?.text?.value || "Aucune réponse générée.";
+
+            // Nettoyage optionnel des annotations de source type 【4:0†source】
+            responseText = responseText.replace(/【.*?】/g, '');
+
+            console.log("✅ Réponse reçue et nettoyée.");
+            return res.json({ result: responseText }); // Format pour Raccourcis
+        } else {
+            console.error(`❌ Le run a échoué : ${run.status}`);
+            return res.status(500).json({ error: `Erreur IA: ${run.status}` });
+        }
 
     } catch (e) {
-        console.error("❌ ERREUR AGENT SDK :", e);
-        res.status(500).json({ error: e.message });
+        console.error("❌ ERREUR SERVEUR :", e);
+        return res.status(500).json({ error: e.message });
     }
 });
 
