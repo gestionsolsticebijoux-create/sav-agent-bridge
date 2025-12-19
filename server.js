@@ -542,63 +542,50 @@ app.post("/sav/general", upload.single("image"), async (req, res) => {
 });
 
 // ==========================================
-// ROUTE 5 : SOURCES TOP 10 (Version Stable - API Assistants)
+// ROUTE 5 : SOURCES TOP 10 (Mode Texte Brut)
 // ==========================================
 
 app.post("/sources/top10", upload.none(), async (req, res) => {
-    console.log("\n🔵 [ROUTE /sources/top10] Demande via API Standard...");
+    console.log("\n🔵 [ROUTE /sources/top10] Demande (Format Texte)...");
 
     try {
-        // 1. Récupération du texte
         const userText = req.body.text;
-        if (!userText) {
-            return res.status(400).json({ error: "Texte manquant" });
-        }
+        if (!userText) return res.status(400).send("Erreur: Texte manquant");
 
-        // 2. Vérification de l'ID
         const assistantId = process.env.SOURCES_ASSISTANT_ID;
-        if (!assistantId) {
-            console.error("❌ Variable SOURCES_ASSISTANT_ID manquante.");
-            return res.status(500).json({ error: "Config serveur manquante" });
-        }
+        if (!assistantId) return res.status(500).send("Erreur: Config ID manquante");
 
-        // 3. Création du Thread
         const thread = await openai.beta.threads.create();
-
-        // 4. Ajout du message utilisateur
         await openai.beta.threads.messages.create(thread.id, {
             role: "user",
             content: userText
         });
 
-        console.log(`⏳ Lancement du Run sur l'assistant ${assistantId}...`);
-
-        // 5. Exécution et attente de la réponse (Polling automatique)
         const run = await openai.beta.threads.runs.createAndPoll(thread.id, {
             assistant_id: assistantId,
         });
 
-        // 6. Traitement du résultat
         if (run.status === 'completed') {
             const messages = await openai.beta.threads.messages.list(thread.id);
-            
-            // Le dernier message de l'assistant
             const lastMessage = messages.data.find(m => m.role === 'assistant');
-            let responseText = lastMessage?.content?.[0]?.text?.value || "Aucune réponse générée.";
+            let responseText = lastMessage?.content?.[0]?.text?.value || "Pas de réponse.";
 
-            // Nettoyage optionnel des annotations de source type 【4:0†source】
+            // Nettoyage des annotations de source [4:0†source] pour que ce soit propre
             responseText = responseText.replace(/【.*?】/g, '');
 
-            console.log("✅ Réponse reçue et nettoyée.");
-            return res.json({ result: responseText }); // Format pour Raccourcis
+            console.log("✅ Réponse texte envoyée.");
+            
+            // ICI : On force le mode TEXTE BRUT (pas de JSON)
+            res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+            return res.send(responseText);
+
         } else {
-            console.error(`❌ Le run a échoué : ${run.status}`);
-            return res.status(500).json({ error: `Erreur IA: ${run.status}` });
+            return res.status(500).send(`Erreur IA : ${run.status}`);
         }
 
     } catch (e) {
-        console.error("❌ ERREUR SERVEUR :", e);
-        return res.status(500).json({ error: e.message });
+        console.error(e);
+        return res.status(500).send(`Erreur Serveur : ${e.message}`);
     }
 });
 
