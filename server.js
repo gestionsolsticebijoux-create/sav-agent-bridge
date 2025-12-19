@@ -17,13 +17,12 @@ if (!process.env.TRACK17_KEY) {
 
 const app = express();
 
-// Augmentation des limites pour les images Base64
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 15 * 1024 * 1024 } // 15 Mo
+  limits: { fileSize: 15 * 1024 * 1024 }
 });
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -79,7 +78,6 @@ async function extractIdentifiers(file) {
     const b64 = file.buffer.toString("base64");
     const dataUrl = `data:${file.mimetype};base64,${b64}`;
 
-    // UTILISATION DE GPT-5-NANO (Extraction Rapide)
     const response = await openai.chat.completions.create({
       model: "gpt-5-nano", 
       response_format: { type: "json_object" },
@@ -97,8 +95,11 @@ async function extractIdentifiers(file) {
                 '  "customer_first_name": string | null,',
                 '  "identifiers": { "email": null, "phone": null, "order_number": null, "tracking_number": null }',
                 "}",
-                "RÈGLES :",
-                "- Tracking Number : Cherche le code-barres ou le numéro de suivi (ex: 1Z..., L..., 87...).",
+                "RÈGLES STRICTES POUR LE TRACKING NUMBER :",
+                "1. Cherche un code alphanumérique de 13 caractères.",
+                "2. FORMAT TYPE : 2 lettres + 9 chiffres + 2 lettres (Exemple: LE123456789FR).",
+                "3. IMPORTANT : Tu DOIS inclure les lettres du début (ex: LE, LP, RK) et de la fin (ex: FR).",
+                "4. Si tu vois 'LE 14...', écris 'LE14...'.",
                 "- Phone : Prends TOUS les chiffres.",
                 "- Prénom : Cherche sur l'étiquette d'expédition."
               ].join("\n")
@@ -228,7 +229,6 @@ async function draftResponseWithVision(data, file) {
         ? `Le client s'appelle ${data.first_name}. Commande trouvée ! Donne le statut et le lien.` 
         : `Le client s'appelle ${data.first_name}. Commande non trouvée. Demande poliment le numéro ou l'email.`;
 
-    // UTILISATION DE GPT-5 (Rédaction Intelligente)
     const response = await openai.chat.completions.create({
         model: "gpt-5",
         messages: [
@@ -279,7 +279,6 @@ app.post("/sav/extract", upload.single("image"), async (req, res) => {
         const b64 = req.file.buffer.toString("base64");
         const dataUrl = `data:${req.file.mimetype};base64,${b64}`;
 
-        // UTILISATION DE GPT-5-NANO (Extraction Rapide & Robuste)
         const response = await openai.chat.completions.create({
             model: "gpt-5-nano",
             response_format: { type: "json_object" },
@@ -292,7 +291,10 @@ app.post("/sav/extract", upload.single("image"), async (req, res) => {
                             "ANALYSE VISUELLE AVANCÉE (ROTATION POSSIBLE).",
                             "Extrais le numéro de suivi (Tracking Number) visible sur cette étiquette.",
                             "JSON ATTENDU : { \"tracking_number\": \"...\" }",
-                            "Règle : Ignore les espaces."
+                            "RÈGLES IMPÉRATIVES :",
+                            "1. Format attendu : XX + 9 chiffres + XX (Ex: LE1735426FR).",
+                            "2. Tu DOIS inclure les lettres du début (LE, LP...) et de la fin (FR).",
+                            "3. Ignore les espaces."
                         ].join("\n")
                     },
                     { type: "image_url", image_url: { url: dataUrl } }
@@ -382,7 +384,6 @@ app.post("/sav/respond", upload.single("image"), async (req, res) => {
         
         console.log(`3. Infos récupérées : Dest=${destination}, Status=${statusInfo}`);
 
-        // UTILISATION DE GPT-5 (Rédaction Robin)
         console.log("4. Rédaction par Robin (GPT-5)...");
         
         let messagesPayload = [
@@ -444,7 +445,6 @@ app.post("/sav/general", upload.single("image"), async (req, res) => {
         OBJECTIF: Répondre selon les instructions : "${instructions}"
         `;
 
-        // UTILISATION DE GPT-5 (Rédaction Générale)
         const response = await openai.chat.completions.create({
             model: "gpt-5",
             messages: [
@@ -465,8 +465,7 @@ app.post("/sav/general", upload.single("image"), async (req, res) => {
 // ==========================================
 // CLIENTS API
 // ==========================================
-
-async function wooFetchOrdersBySearch(term) { /* ... Code existant inchangé ... */
+async function wooFetchOrdersBySearch(term) {
   const base = requireEnv("WC_BASE_URL").replace(/\/$/, "");
   const ck = requireEnv("WC_CONSUMER_KEY");
   const cs = requireEnv("WC_CONSUMER_SECRET");
@@ -477,7 +476,7 @@ async function wooFetchOrdersBySearch(term) { /* ... Code existant inchangé ...
   if (!r.ok) return [];
   return await r.json();
 }
-async function wooFetchOrderById(id) { /* ... Code existant inchangé ... */
+async function wooFetchOrderById(id) {
     const base = requireEnv("WC_BASE_URL").replace(/\/$/, "");
     const ck = requireEnv("WC_CONSUMER_KEY");
     const cs = requireEnv("WC_CONSUMER_SECRET");
@@ -485,7 +484,7 @@ async function wooFetchOrderById(id) { /* ... Code existant inchangé ... */
     if (!r.ok) return null;
     return await r.json();
 }
-async function wooLookupBySearchTerm(term) { /* ... Code existant inchangé ... */
+async function wooLookupBySearchTerm(term) {
   const orders = await wooFetchOrdersBySearch(term);
   if (!orders || !orders.length) return { order_number: null };
   const latest = orders[0];
@@ -499,7 +498,7 @@ async function wooLookupBySearchTerm(term) { /* ... Code existant inchangé ... 
   const country = latest.shipping?.country || latest.billing?.country || "FR";
   return { order_number: latest.id, tracking_number: tn, country: country };
 }
-async function sendcloudGet(path) { /* ... Code existant inchangé ... */
+async function sendcloudGet(path) {
   const pub = requireEnv("SENDCLOUD_PUBLIC_KEY");
   const sec = requireEnv("SENDCLOUD_SECRET_KEY");
   const r = await fetch(`https://panel.sendcloud.sc${path}`, { headers: { Authorization: basicAuthHeader(pub, sec) } });
