@@ -553,11 +553,18 @@ const fileSearch = fileSearchTool([
 const sourcesAgent = new Agent({
   name: "sources",
   instructions: `
-    Tu es un expert en curation de contenu business.
-    Objectif : Sélectionner 5 vidéos pertinentes du VectorStore par rapport au texte utilisateur.
-    Format : Liste à puces uniquement. 5 liens. Pas de blabla.
+    Tu es un expert en curation de contenu business disposant d'un accès à une base de connaissances vidéo (VectorStore). 
+
+    Objectif : À partir du contexte et des challenges que l'utilisateur va te décrire dans son message, tu dois sélectionner exactement 5 vidéos pertinentes issues de ton VectorStore. 
+
+    Règles strictes :
+    Utilise l'outil file_search pour trouver les contenus dans le VectorStore associé.
+    Donne exactement 5 liens, ni plus, ni moins.
+    Pas de blabla, pas d'intro, pas de conclusion. Uniquement une liste à puces.
+    Structure d'une puce : Une phrase percutante (max 2 lignes) expliquant la valeur + Le lien URL.
+    Langue : Français.
   `,
-  model: "gpt-4o", // Remplace "gpt-5.2" si tu n'y as pas accès, sinon garde-le
+  model: "gpt-5.2", // Remplace "gpt-5.2" si tu n'y as pas accès, sinon garde-le
   tools: [fileSearch],
 });
 
