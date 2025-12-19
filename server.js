@@ -267,38 +267,48 @@ app.post("/sav/analyze", upload.single("image"), async (req, res) => {
 });
 
 // ==========================================
-// ROUTE 2-A : EXTRACTION PURE (/sav/extract)
+// ROUTE 2-A : EXTRACTION TEXTUELLE (/sav/extract)
+// (Prend du TEXTE brut -> Renvoie JUSTE le numéro nettoyé)
 // ==========================================
 
-app.post("/sav/extract", upload.single("image"), async (req, res) => {
-    console.log("\n🔵 [ROUTE /sav/extract] Début extraction...");
+app.post("/sav/extract", upload.none(), async (req, res) => {
+    console.log("\n🔵 [ROUTE /sav/extract] Début analyse texte...");
     
     try {
-        if (!req.file) return res.status(400).send("Erreur: Image manquante");
+        // On récupère le texte envoyé par l'iPhone (OCR)
+        const rawText = req.body.raw_text;
 
-        const b64 = req.file.buffer.toString("base64");
-        const dataUrl = `data:${req.file.mimetype};base64,${b64}`;
+        if (!rawText) {
+            console.error("❌ ERREUR: Aucune donnée texte reçue (champ 'raw_text' vide).");
+            return res.status(400).send("Erreur: Texte manquant");
+        }
 
+        console.log(`📝 Texte reçu (${rawText.length} caractères) : "${rawText.substring(0, 50).replace(/\n/g, ' ')}..."`);
+
+        // UTILISATION DE GPT-5-NANO (Suffisant pour analyser du texte)
         const response = await openai.chat.completions.create({
             model: "gpt-5-nano",
             response_format: { type: "json_object" },
             messages: [
-                { role: "system", content: "Tu es un lecteur optique de précision." },
-                { role: "user", content: [
-                    { 
-                        type: "text", 
-                        text: [
-                            "ANALYSE VISUELLE AVANCÉE (ROTATION POSSIBLE).",
-                            "Extrais le numéro de suivi (Tracking Number) visible sur cette étiquette.",
-                            "JSON ATTENDU : { \"tracking_number\": \"...\" }",
-                            "RÈGLES IMPÉRATIVES :",
-                            "1. Format attendu : XX + 9 chiffres + XX (Ex: LE1735426FR).",
-                            "2. Tu DOIS inclure les lettres du début (LE, LP...) et de la fin (FR).",
-                            "3. Ignore les espaces."
-                        ].join("\n")
-                    },
-                    { type: "image_url", image_url: { url: dataUrl } }
-                ]}
+                { role: "system", content: "Tu es un expert en correction de données logistiques." },
+                { role: "user", content: 
+                    `Voici un texte brut extrait d'une étiquette de colis (OCR).
+                    
+                    TA MISSION :
+                    Trouve et isole le Numéro de Suivi (Tracking Number).
+                    
+                    RÈGLES DE DÉTECTION :
+                    1. Format standard : 2 Lettres + 9 Chiffres + 2 Lettres (Ex: LE123456789FR).
+                    2. Variantes possibles : 1Z... (UPS), 87... (Colissimo).
+                    3. CORRECTION D'ERREURS : 
+                       - L'OCR met souvent des espaces (ex: "LE 14 55" -> "LE1455"). Supprime-les.
+                       - Il peut confondre le chiffre '0' et la lettre 'O'. Corrige selon le format standard.
+                    
+                    TEXTE À ANALYSER :
+                    """${rawText}"""
+                    
+                    JSON ATTENDU : { "tracking_number": "LE..." }`
+                }
             ]
         });
 
@@ -306,18 +316,19 @@ app.post("/sav/extract", upload.single("image"), async (req, res) => {
         const trackingNumber = content.tracking_number;
 
         if (!trackingNumber) {
-            console.warn("⚠️ Aucun numéro trouvé.");
+            console.warn("⚠️ Aucun numéro trouvé dans le texte.");
             return res.status(404).send("NON_TROUVE");
         }
 
+        // Nettoyage final de sécurité
         const cleanTracking = trackingNumber.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
-        console.log(`✅ Numéro trouvé et nettoyé : ${cleanTracking}`);
+        console.log(`✅ Numéro extrait et nettoyé : ${cleanTracking}`);
         
         res.setHeader('Content-Type', 'text/plain; charset=utf-8');
         return res.send(cleanTracking);
 
     } catch (e) {
-        console.error("❌ ERREUR Extraction:", e);
+        console.error("❌ ERREUR Extraction Texte:", e);
         res.status(500).send(`Erreur serveur: ${e.message}`);
     }
 });
