@@ -670,7 +670,7 @@ app.post("/chat/gpt5", upload.single("image"), async (req, res) => {
             model: "gpt-5.2",
             prompt: {
                 "id": PROMPT_ID,
-                "version": "2"
+                "version": "5"
             },
             input: inputsArray,
             store: true
