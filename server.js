@@ -3,6 +3,8 @@ import express from "express";
 import multer from "multer";
 import OpenAI from "openai";
 import { Agent, Runner, fileSearchTool } from "@openai/agents";
+import fs from "fs";
+import path from "path";
 
 // ==========================================
 // 1. CONFIGURATION
@@ -587,6 +589,119 @@ app.post("/sources/top10", upload.none(), async (req, res) => {
     } catch (e) {
         console.error(e);
         return res.status(500).send(`Erreur Serveur : ${e.message}`);
+    }
+});
+
+// ==========================================
+// ROUTE 6 : CHAT GPT-5.2 (Avec mémoire serveur "history.json")
+// ==========================================
+
+const HISTORY_FILE = path.join(process.cwd(), "history.json");
+
+app.post("/chat/gpt5", upload.single("image"), async (req, res) => {
+    console.log("\n🔵 [ROUTE /chat/gpt5] Discussion avec mémoire serveur...");
+
+    try {
+        const userMessage = req.body.message || req.body.prompt;
+        // On regarde si le client demande un reset (nouveau thread)
+        // On gère le string "true" (cas fréquent en form-data) ou le booléen
+        const isNewThread = req.body.new_thread === "true" || req.body.new_thread === true;
+
+        const PROMPT_ID = "pmpt_6901002708c0819682d17ea7dddecc5d09ec040d95dda014";
+
+        if (!userMessage && !req.file && !isNewThread) {
+            return res.status(400).send("Erreur: Message manquant.");
+        }
+
+        // 1. GESTION DE L'HISTORIQUE
+        let conversation = [];
+
+        if (isNewThread) {
+            console.log("🧹 Demande de nouveau thread : Historique effacé.");
+            // On repart à zéro, conversation reste vide []
+            // On peut supprimer le fichier physiquement pour être propre
+            if (fs.existsSync(HISTORY_FILE)) fs.unlinkSync(HISTORY_FILE);
+        } else {
+            // On tente de charger l'historique existant
+            if (fs.existsSync(HISTORY_FILE)) {
+                try {
+                    const raw = fs.readFileSync(HISTORY_FILE, "utf-8");
+                    conversation = JSON.parse(raw);
+                    console.log(`📖 Historique chargé : ${conversation.length} messages précédents.`);
+                } catch (err) {
+                    console.error("⚠️ Erreur lecture historique (corrompu ?), on repart à zéro.");
+                }
+            }
+        }
+
+        // 2. PRÉPARATION DU MESSAGE ACTUEL (USER)
+        // On stocke une version simplifiée dans notre JSON local pour faciliter la lecture/écriture
+        const currentUserMsg = { role: "user", content: userMessage, hasImage: !!req.file };
+        conversation.push(currentUserMsg);
+
+        // 3. CONSTRUCTION PAYLOAD OPENAI (Format strict 'input_text')
+        // On transforme notre historique simple en format complexe pour l'API Responses
+        const inputsArray = conversation.map(msg => {
+            const contentBlock = [];
+            
+            // Si le message a du texte (ce qui est le cas général, sauf si image seule)
+            if (msg.content) {
+                contentBlock.push({ type: "input_text", text: msg.content });
+            }
+            
+            // Note : Pour l'instant, on ne stocke pas les base64 des anciennes images dans le history.json
+            // car le fichier deviendrait énorme (plusieurs Mo). 
+            // Si c'est le message ACTUEL et qu'il y a une image, on l'ajoute.
+            if (msg === currentUserMsg && req.file) {
+                 const b64 = req.file.buffer.toString("base64");
+                 const dataUrl = `data:${req.file.mimetype};base64,${b64}`;
+                 contentBlock.push({ type: "image_url", image_url: { url: dataUrl } });
+            }
+
+            return {
+                role: msg.role,
+                content: contentBlock
+            };
+        });
+
+        console.log(`🚀 Envoi à OpenAI (${inputsArray.length} tours de parole)...`);
+
+        // 4. APPEL API
+        const response = await openai.responses.create({
+            model: "gpt-5.2",
+            prompt: {
+                "id": PROMPT_ID,
+                "version": "2"
+            },
+            input: inputsArray,
+            store: true
+        });
+
+        // 5. RÉCUPÉRATION DE LA RÉPONSE
+        let replyText = "Pas de réponse.";
+        if (response.output_text) {
+            replyText = response.output_text;
+        } else if (response.content) {
+            const textBlock = response.content.find(c => c.type === 'output_text');
+            if (textBlock) replyText = textBlock.text;
+        } else if (response.choices) {
+            replyText = response.choices[0].message.content;
+        }
+
+        // 6. SAUVEGARDE DE LA RÉPONSE (ASSISTANT) DANS LE JSON
+        conversation.push({ role: "assistant", content: replyText });
+        
+        // On écrit le fichier
+        fs.writeFileSync(HISTORY_FILE, JSON.stringify(conversation, null, 2));
+        console.log("💾 Historique sauvegardé sur le serveur.");
+
+        // 7. ENVOI AU CLIENT
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+        return res.send(replyText);
+
+    } catch (e) {
+        console.error("❌ ERREUR:", e);
+        res.status(500).send(`Erreur serveur: ${e.message}`);
     }
 });
 
