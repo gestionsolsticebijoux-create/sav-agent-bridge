@@ -669,8 +669,7 @@ app.post("/chat/gpt5", upload.single("image"), async (req, res) => {
         const response = await openai.responses.create({
             model: "gpt-5.2",
             prompt: {
-                "id": PROMPT_ID,
-                "version": "5"
+                "id": PROMPT_ID
             },
             input: inputsArray,
             store: true
