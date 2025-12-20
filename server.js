@@ -593,7 +593,7 @@ app.post("/sources/top10", upload.none(), async (req, res) => {
 });
 
 // ==========================================
-// ROUTE 6 : CHAT GPT-5.2 (Avec mémoire serveur "history.json")
+// ROUTE 6 : CHAT GPT-5.2 (CORRIGÉE)
 // ==========================================
 
 const HISTORY_FILE = path.join(process.cwd(), "history.json");
@@ -603,10 +603,9 @@ app.post("/chat/gpt5", upload.single("image"), async (req, res) => {
 
     try {
         const userMessage = req.body.message || req.body.prompt;
-        // On regarde si le client demande un reset (nouveau thread)
-        // On gère le string "true" (cas fréquent en form-data) ou le booléen
+        
+        // Gestion du reset via le paramètre new_thread
         const isNewThread = req.body.new_thread === "true" || req.body.new_thread === true;
-
         const PROMPT_ID = "pmpt_6901002708c0819682d17ea7dddecc5d09ec040d95dda014";
 
         if (!userMessage && !req.file && !isNewThread) {
@@ -618,43 +617,43 @@ app.post("/chat/gpt5", upload.single("image"), async (req, res) => {
 
         if (isNewThread) {
             console.log("🧹 Demande de nouveau thread : Historique effacé.");
-            // On repart à zéro, conversation reste vide []
-            // On peut supprimer le fichier physiquement pour être propre
             if (fs.existsSync(HISTORY_FILE)) fs.unlinkSync(HISTORY_FILE);
         } else {
-            // On tente de charger l'historique existant
             if (fs.existsSync(HISTORY_FILE)) {
                 try {
                     const raw = fs.readFileSync(HISTORY_FILE, "utf-8");
                     conversation = JSON.parse(raw);
-                    console.log(`📖 Historique chargé : ${conversation.length} messages précédents.`);
+                    console.log(`📖 Historique chargé : ${conversation.length} messages.`);
                 } catch (err) {
-                    console.error("⚠️ Erreur lecture historique (corrompu ?), on repart à zéro.");
+                    console.error("⚠️ Erreur lecture historique, reset.");
                 }
             }
         }
 
-        // 2. PRÉPARATION DU MESSAGE ACTUEL (USER)
-        // On stocke une version simplifiée dans notre JSON local pour faciliter la lecture/écriture
-        const currentUserMsg = { role: "user", content: userMessage, hasImage: !!req.file };
+        // 2. AJOUT DU MESSAGE ACTUEL (USER)
+        const currentUserMsg = { role: "user", content: userMessage };
         conversation.push(currentUserMsg);
 
-        // 3. CONSTRUCTION PAYLOAD OPENAI (Format strict 'input_text')
-        // On transforme notre historique simple en format complexe pour l'API Responses
+        // 3. CONSTRUCTION PAYLOAD (CORRECTION TYPE input_text / output_text)
         const inputsArray = conversation.map(msg => {
             const contentBlock = [];
             
-            // Si le message a du texte (ce qui est le cas général, sauf si image seule)
             if (msg.content) {
-                contentBlock.push({ type: "input_text", text: msg.content });
+                // ⚠️ C'EST ICI QUE ÇA PLANTAIT AVANT ⚠️
+                if (msg.role === "assistant") {
+                    // Si c'est l'IA qui parle, c'est du OUTPUT_TEXT
+                    contentBlock.push({ type: "output_text", text: msg.content });
+                } else {
+                    // Si c'est l'utilisateur, c'est du INPUT_TEXT
+                    contentBlock.push({ type: "input_text", text: msg.content });
+                }
             }
             
-            // Note : Pour l'instant, on ne stocke pas les base64 des anciennes images dans le history.json
-            // car le fichier deviendrait énorme (plusieurs Mo). 
-            // Si c'est le message ACTUEL et qu'il y a une image, on l'ajoute.
+            // Gestion de l'image (seulement pour le message actuel)
             if (msg === currentUserMsg && req.file) {
                  const b64 = req.file.buffer.toString("base64");
                  const dataUrl = `data:${req.file.mimetype};base64,${b64}`;
+                 // Note: input_image ou image_url selon la version de l'API, ici image_url est standard
                  contentBlock.push({ type: "image_url", image_url: { url: dataUrl } });
             }
 
@@ -664,9 +663,9 @@ app.post("/chat/gpt5", upload.single("image"), async (req, res) => {
             };
         });
 
-        console.log(`🚀 Envoi à OpenAI (${inputsArray.length} tours de parole)...`);
+        console.log(`🚀 Envoi à OpenAI (${inputsArray.length} tours)...`);
 
-        // 4. APPEL API
+        // 4. APPEL API RESPONSES
         const response = await openai.responses.create({
             model: "gpt-5.2",
             prompt: {
@@ -677,23 +676,23 @@ app.post("/chat/gpt5", upload.single("image"), async (req, res) => {
             store: true
         });
 
-        // 5. RÉCUPÉRATION DE LA RÉPONSE
+        // 5. RÉCUPÉRATION RÉPONSE
         let replyText = "Pas de réponse.";
+        
+        // Logique de récupération robuste (parfois output_text, parfois content)
         if (response.output_text) {
             replyText = response.output_text;
         } else if (response.content) {
-            const textBlock = response.content.find(c => c.type === 'output_text');
-            if (textBlock) replyText = textBlock.text;
+            const textBlock = response.content.find(c => c.type === 'output_text' || c.type === 'text');
+            if (textBlock) replyText = textBlock.text || textBlock.value;
         } else if (response.choices) {
             replyText = response.choices[0].message.content;
         }
 
-        // 6. SAUVEGARDE DE LA RÉPONSE (ASSISTANT) DANS LE JSON
+        // 6. SAUVEGARDE RÉPONSE DANS L'HISTORIQUE
         conversation.push({ role: "assistant", content: replyText });
-        
-        // On écrit le fichier
         fs.writeFileSync(HISTORY_FILE, JSON.stringify(conversation, null, 2));
-        console.log("💾 Historique sauvegardé sur le serveur.");
+        console.log("💾 Historique mis à jour.");
 
         // 7. ENVOI AU CLIENT
         res.setHeader('Content-Type', 'text/plain; charset=utf-8');
