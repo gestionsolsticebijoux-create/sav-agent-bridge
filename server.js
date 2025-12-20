@@ -5,7 +5,9 @@ import OpenAI from "openai";
 import { Agent, Runner, fileSearchTool } from "@openai/agents";
 import fs from "fs";
 import path from "path";
-
+// Stockage temporaire des réponses (en mémoire RAM)
+// Structure : { "ticket_ID": { status: "pending" | "done", result: "..." } }
+const tasks = {};
 // ==========================================
 // 1. CONFIGURATION
 // ==========================================
@@ -593,113 +595,113 @@ app.post("/sources/top10", upload.none(), async (req, res) => {
 });
 
 // ==========================================
-// ROUTE 6 : CHAT GPT-5.2 (CORRIGÉE)
+// ROUTE 6-A : DÉMARRAGE TÂCHE (ASYNC)
 // ==========================================
+app.post("/chat/start", upload.single("image"), async (req, res) => {
+    // 1. Générer un ID unique pour ce ticket
+    const ticketId = "ticket_" + Date.now();
+    console.log(`\n🎫 Nouveau ticket créé : ${ticketId}`);
 
-const HISTORY_FILE = path.join(process.cwd(), "history.json");
+    // 2. Initialiser le statut
+    tasks[ticketId] = { status: "pending", result: null };
 
-app.post("/chat/gpt5", upload.single("image"), async (req, res) => {
-    console.log("\n🔵 [ROUTE /chat/gpt5] Discussion avec mémoire serveur...");
+    // 3. Répondre TOUT DE SUITE à l'iPhone pour ne pas timeout
+    res.json({ ticket_id: ticketId, status: "pending", message: "Traitement démarré..." });
 
+    // 4. Lancer le travail LOURD en arrière-plan (sans bloquer la réponse)
+    // (On ne met pas 'await' ici pour ne pas bloquer)
+    processGPTRequest(ticketId, req.body, req.file).catch(err => {
+        console.error(`❌ Erreur Background ${ticketId}:`, err);
+        tasks[ticketId] = { status: "error", result: "Erreur interne." };
+    });
+});
+
+// La fonction lourde qui parle à OpenAI (ex-contenu de ta route)
+async function processGPTRequest(ticketId, body, file) {
+    const userMessage = body.message || body.prompt;
+    const isNewThread = body.new_thread === "true" || body.new_thread === true;
+    const HISTORY_FILE = path.join(process.cwd(), "history.json");
+    const PROMPT_ID = "pmpt_6901002708c0819682d17ea7dddecc5d09ec040d95dda014";
+
+    // ... (Logique de chargement historique identique à avant) ...
+    let conversation = [];
+    if (isNewThread && fs.existsSync(HISTORY_FILE)) fs.unlinkSync(HISTORY_FILE);
+    else if (fs.existsSync(HISTORY_FILE)) {
+        try { conversation = JSON.parse(fs.readFileSync(HISTORY_FILE, "utf-8")); } catch(e){}
+    }
+    
+    // Ajout message user
+    const currentUserMsg = { role: "user", content: userMessage };
+    conversation.push(currentUserMsg);
+
+    // Construction Inputs
+    const inputsArray = conversation.map(msg => {
+        const contentBlock = [];
+        if (msg.content) {
+            contentBlock.push({ 
+                type: (msg.role === "assistant" ? "output_text" : "input_text"), 
+                text: msg.content 
+            });
+        }
+        if (msg === currentUserMsg && file) {
+             const b64 = file.buffer.toString("base64");
+             contentBlock.push({ type: "image_url", image_url: { url: `data:${file.mimetype};base64,${b64}` } });
+        }
+        return { role: msg.role, content: contentBlock };
+    });
+
+    console.log(`🤖 [${ticketId}] Envoi à OpenAI...`);
+    
     try {
-        const userMessage = req.body.message || req.body.prompt;
-        
-        // Gestion du reset via le paramètre new_thread
-        const isNewThread = req.body.new_thread === "true" || req.body.new_thread === true;
-        const PROMPT_ID = "pmpt_6901002708c0819682d17ea7dddecc5d09ec040d95dda014";
-
-        if (!userMessage && !req.file && !isNewThread) {
-            return res.status(400).send("Erreur: Message manquant.");
-        }
-
-        // 1. GESTION DE L'HISTORIQUE
-        let conversation = [];
-
-        if (isNewThread) {
-            console.log("🧹 Demande de nouveau thread : Historique effacé.");
-            if (fs.existsSync(HISTORY_FILE)) fs.unlinkSync(HISTORY_FILE);
-        } else {
-            if (fs.existsSync(HISTORY_FILE)) {
-                try {
-                    const raw = fs.readFileSync(HISTORY_FILE, "utf-8");
-                    conversation = JSON.parse(raw);
-                    console.log(`📖 Historique chargé : ${conversation.length} messages.`);
-                } catch (err) {
-                    console.error("⚠️ Erreur lecture historique, reset.");
-                }
-            }
-        }
-
-        // 2. AJOUT DU MESSAGE ACTUEL (USER)
-        const currentUserMsg = { role: "user", content: userMessage };
-        conversation.push(currentUserMsg);
-
-        // 3. CONSTRUCTION PAYLOAD (CORRECTION TYPE input_text / output_text)
-        const inputsArray = conversation.map(msg => {
-            const contentBlock = [];
-            
-            if (msg.content) {
-                // ⚠️ C'EST ICI QUE ÇA PLANTAIT AVANT ⚠️
-                if (msg.role === "assistant") {
-                    // Si c'est l'IA qui parle, c'est du OUTPUT_TEXT
-                    contentBlock.push({ type: "output_text", text: msg.content });
-                } else {
-                    // Si c'est l'utilisateur, c'est du INPUT_TEXT
-                    contentBlock.push({ type: "input_text", text: msg.content });
-                }
-            }
-            
-            // Gestion de l'image (seulement pour le message actuel)
-            if (msg === currentUserMsg && req.file) {
-                 const b64 = req.file.buffer.toString("base64");
-                 const dataUrl = `data:${req.file.mimetype};base64,${b64}`;
-                 // Note: input_image ou image_url selon la version de l'API, ici image_url est standard
-                 contentBlock.push({ type: "image_url", image_url: { url: dataUrl } });
-            }
-
-            return {
-                role: msg.role,
-                content: contentBlock
-            };
-        });
-
-        console.log(`🚀 Envoi à OpenAI (${inputsArray.length} tours)...`);
-
-        // 4. APPEL API RESPONSES
         const response = await openai.responses.create({
             model: "gpt-5.2",
-            prompt: {
-                "id": PROMPT_ID
-            },
+            prompt: { "id": PROMPT_ID },
             input: inputsArray,
             store: true
         });
 
-        // 5. RÉCUPÉRATION RÉPONSE
+        // Extraction réponse
         let replyText = "Pas de réponse.";
-        
-        // Logique de récupération robuste (parfois output_text, parfois content)
-        if (response.output_text) {
-            replyText = response.output_text;
-        } else if (response.content) {
-            const textBlock = response.content.find(c => c.type === 'output_text' || c.type === 'text');
-            if (textBlock) replyText = textBlock.text || textBlock.value;
-        } else if (response.choices) {
-            replyText = response.choices[0].message.content;
-        }
+        if (response.output_text) replyText = response.output_text;
+        else if (response.content) {
+            const t = response.content.find(c => c.type === 'output_text' || c.type === 'text');
+            if (t) replyText = t.text || t.value;
+        } else if (response.choices) replyText = response.choices[0].message.content;
 
-        // 6. SAUVEGARDE RÉPONSE DANS L'HISTORIQUE
+        // Sauvegarde historique + Mise à jour du Ticket
         conversation.push({ role: "assistant", content: replyText });
         fs.writeFileSync(HISTORY_FILE, JSON.stringify(conversation, null, 2));
-        console.log("💾 Historique mis à jour.");
-
-        // 7. ENVOI AU CLIENT
-        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-        return res.send(replyText);
+        
+        console.log(`✅ [${ticketId}] Terminé !`);
+        tasks[ticketId] = { status: "done", result: replyText };
 
     } catch (e) {
-        console.error("❌ ERREUR:", e);
-        res.status(500).send(`Erreur serveur: ${e.message}`);
+        console.error(`❌ [${ticketId}] Erreur OpenAI:`, e);
+        tasks[ticketId] = { status: "error", result: e.message };
+    }
+}
+
+// ==========================================
+// ROUTE 6-B : VÉRIFICATION STATUT (POLLING)
+// ==========================================
+app.post("/chat/check", async (req, res) => {
+    const ticketId = req.body.ticket_id;
+    const task = tasks[ticketId];
+
+    if (!task) {
+        return res.json({ status: "error", message: "Ticket introuvable" });
+    }
+
+    if (task.status === "done") {
+        // C'est fini ! On envoie la réponse et on nettoie la mémoire
+        res.json({ status: "done", reply: task.result });
+        delete tasks[ticketId]; // Ménage
+    } else if (task.status === "error") {
+        res.json({ status: "error", message: task.result });
+        delete tasks[ticketId];
+    } else {
+        // Encore en cours
+        res.json({ status: "pending" });
     }
 });
 
