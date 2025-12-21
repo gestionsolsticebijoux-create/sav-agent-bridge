@@ -754,24 +754,40 @@ async function processGPTRequest(ticketId, body, file, isNewThread) {
 // ==========================================
 // ROUTE 6-B : VÉRIFICATION STATUT (POLLING)
 // ==========================================
-app.post("/chat/check", async (req, res) => {
-    const ticketId = req.body.ticket_id;
-    const task = tasks[ticketId];
+// AJOUT IMPORTANT : "upload.none()" permet de lire le formulaire envoyé par l'iPhone
+app.post("/chat/check", upload.none(), async (req, res) => {
+    try {
+        const ticketId = req.body.ticket_id;
+        
+        // Debug : On vérifie ce qu'on reçoit
+        // console.log(`🔍 Check reçu pour : ${ticketId}`); 
 
-    if (!task) {
-        return res.json({ status: "error", message: "Ticket introuvable" });
-    }
+        if (!ticketId) {
+             return res.json({ status: "error", message: "Aucun ticket_id reçu" });
+        }
 
-    if (task.status === "done") {
-        // C'est fini ! On envoie la réponse et on nettoie la mémoire
-        res.json({ status: "done", reply: task.result });
-        delete tasks[ticketId]; // Ménage
-    } else if (task.status === "error") {
-        res.json({ status: "error", message: task.result });
-        delete tasks[ticketId];
-    } else {
-        // Encore en cours
-        res.json({ status: "pending" });
+        const task = tasks[ticketId];
+
+        if (!task) {
+            // Si le ticket n'existe pas, c'est peut-être que le serveur a redémarré
+            // ou que l'ID est mauvais.
+            return res.json({ status: "pending", message: "Ticket introuvable ou expiré" });
+        }
+
+        if (task.status === "done") {
+            // C'est fini ! On envoie la réponse et on nettoie la mémoire
+            res.json({ status: "done", reply: task.result });
+            delete tasks[ticketId]; // Ménage
+        } else if (task.status === "error") {
+            res.json({ status: "error", message: task.result });
+            delete tasks[ticketId];
+        } else {
+            // Encore en cours
+            res.json({ status: "pending" });
+        }
+    } catch (error) {
+        console.error("Erreur dans /chat/check:", error);
+        res.status(500).json({ status: "error", message: "Erreur serveur" });
     }
 });
 
