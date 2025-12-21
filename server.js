@@ -595,89 +595,159 @@ app.post("/sources/top10", upload.none(), async (req, res) => {
 });
 
 // ==========================================
+// CONFIGURATION DE L'HISTORIQUE
+// ==========================================
+// On stocke ça à la racine du serveur.
+// Sur Railway, ce fichier existe tant que le serveur ne redémarre pas.
+const HISTORY_FILE = path.join(process.cwd(), "coach_history.json");
+
+// ==========================================
 // ROUTE 6-A : DÉMARRAGE TÂCHE (ASYNC)
 // ==========================================
 app.post("/chat/start", upload.single("image"), async (req, res) => {
-    // 1. Générer un ID unique pour ce ticket
+    // 1. Récupération des paramètres
+    // On force la conversion en booléen car le form-data envoie souvent des strings "true"/"false"
+    const isNewThread = req.body.new_thread === "true" || req.body.new_thread === true;
+    
+    // 2. Création du ticket
     const ticketId = "ticket_" + Date.now();
-    console.log(`\n🎫 Nouveau ticket créé : ${ticketId}`);
+    console.log(`\n🎫 Nouveau ticket créé : ${ticketId} (Nouvelle discussion : ${isNewThread})`);
 
-    // 2. Initialiser le statut
+    // 3. Initialisation du statut dans la mémoire RAM
     tasks[ticketId] = { status: "pending", result: null };
 
-    // 3. Répondre TOUT DE SUITE à l'iPhone pour ne pas timeout
-    res.json({ ticket_id: ticketId, status: "pending", message: "Traitement démarré..." });
+    // 4. Réponse immédiate à l'iPhone (pour éviter le timeout)
+    res.json({ ticket_id: ticketId, status: "pending", message: "Analyse en cours..." });
 
-    // 4. Lancer le travail LOURD en arrière-plan (sans bloquer la réponse)
-    // (On ne met pas 'await' ici pour ne pas bloquer)
-    processGPTRequest(ticketId, req.body, req.file).catch(err => {
+    // 5. Lancement du travail en arrière-plan
+    processGPTRequest(ticketId, req.body, req.file, isNewThread).catch(err => {
         console.error(`❌ Erreur Background ${ticketId}:`, err);
-        tasks[ticketId] = { status: "error", result: "Erreur interne." };
+        tasks[ticketId] = { status: "error", result: "Erreur interne lors du traitement." };
     });
 });
 
-// La fonction lourde qui parle à OpenAI (ex-contenu de ta route)
-async function processGPTRequest(ticketId, body, file) {
+// ==========================================
+// FONCTION DE TRAITEMENT (Cerveau & Mémoire)
+// ==========================================
+async function processGPTRequest(ticketId, body, file, isNewThread) {
     const userMessage = body.message || body.prompt;
-    const isNewThread = body.new_thread === "true" || body.new_thread === true;
-    const HISTORY_FILE = path.join(process.cwd(), "history.json");
-    const PROMPT_ID = "pmpt_6901002708c0819682d17ea7dddecc5d09ec040d95dda014";
+    const PROMPT_ID = "pmpt_6901002708c0819682d17ea7dddecc5d09ec040d95dda014"; // Ton ID de prompt
 
-    // ... (Logique de chargement historique identique à avant) ...
-    let conversation = [];
-    if (isNewThread && fs.existsSync(HISTORY_FILE)) fs.unlinkSync(HISTORY_FILE);
-    else if (fs.existsSync(HISTORY_FILE)) {
-        try { conversation = JSON.parse(fs.readFileSync(HISTORY_FILE, "utf-8")); } catch(e){}
-    }
+    // --- A. GESTION DE LA MÉMOIRE (FICHIER JSON) ---
     
-    // Ajout message user
-    const currentUserMsg = { role: "user", content: userMessage };
+    let conversation = [];
+
+    // Si on demande une nouvelle discussion, on supprime l'ancien fichier s'il existe
+    if (isNewThread) {
+        if (fs.existsSync(HISTORY_FILE)) {
+            try {
+                fs.unlinkSync(HISTORY_FILE);
+                console.log("🗑️ Historique effacé (Nouvelle discussion).");
+            } catch (e) {
+                console.error("Erreur suppression historique:", e);
+            }
+        }
+    } else {
+        // Sinon, on essaie de charger l'historique existant
+        if (fs.existsSync(HISTORY_FILE)) {
+            try {
+                const rawData = fs.readFileSync(HISTORY_FILE, "utf-8");
+                conversation = JSON.parse(rawData);
+                console.log(`📂 Historique chargé : ${conversation.length} messages précédents.`);
+            } catch (e) {
+                console.error("Erreur lecture historique (repart à 0):", e);
+                conversation = [];
+            }
+        }
+    }
+
+    // --- B. AJOUT DU NOUVEAU MESSAGE UTILISATEUR ---
+    
+    // On prépare l'objet message actuel
+    const currentUserMsg = { 
+        role: "user", 
+        content: userMessage,
+        hasImage: !!file // Petit marqueur pour savoir si ce message a une image
+    };
+    
+    // On l'ajoute à la liste temporaire (pas encore sauvegardé)
     conversation.push(currentUserMsg);
 
-    // Construction Inputs
+    // --- C. PRÉPARATION POUR OPENAI ---
+    // On transforme l'historique simple en format complexe attendu par ton appel `responses.create`
+    
     const inputsArray = conversation.map(msg => {
         const contentBlock = [];
+        
+        // Gestion du texte
         if (msg.content) {
             contentBlock.push({ 
+                // Si c'est l'assistant, c'est une sortie (output), sinon entrée (input)
                 type: (msg.role === "assistant" ? "output_text" : "input_text"), 
                 text: msg.content 
             });
         }
+
+        // Gestion de l'image (Uniquement pour le message ACTUEL qui vient d'arriver)
+        // (On ne renvoie pas les anciennes images pour économiser la bande passante/tokens, sauf si nécessaire)
         if (msg === currentUserMsg && file) {
              const b64 = file.buffer.toString("base64");
-             contentBlock.push({ type: "image_url", image_url: { url: `data:${file.mimetype};base64,${b64}` } });
+             contentBlock.push({ 
+                 type: "image_url", 
+                 image_url: { url: `data:${file.mimetype};base64,${b64}` } 
+             });
         }
+
         return { role: msg.role, content: contentBlock };
     });
 
-    console.log(`🤖 [${ticketId}] Envoi à OpenAI...`);
+    console.log(`🤖 [${ticketId}] Envoi à OpenAI (${inputsArray.length} messages dans le contexte)...`);
+
+    // --- D. APPEL API ---
     
     try {
         const response = await openai.responses.create({
-            model: "gpt-5.2",
+            model: "gpt-5.2", // Ton modèle spécifique
             prompt: { "id": PROMPT_ID },
             input: inputsArray,
-            store: true
+            store: true // Stockage côté OpenAI
         });
 
-        // Extraction réponse
-        let replyText = "Pas de réponse.";
-        if (response.output_text) replyText = response.output_text;
-        else if (response.content) {
+        // --- E. RÉCUPÉRATION DE LA RÉPONSE ---
+        
+        let replyText = "Pas de réponse intelligible.";
+        
+        // Logique robuste pour trouver le texte dans la réponse
+        if (response.output_text) {
+            replyText = response.output_text;
+        } else if (response.content) {
             const t = response.content.find(c => c.type === 'output_text' || c.type === 'text');
             if (t) replyText = t.text || t.value;
-        } else if (response.choices) replyText = response.choices[0].message.content;
+        } else if (response.choices && response.choices[0]) {
+            replyText = response.choices[0].message.content;
+        }
 
-        // Sauvegarde historique + Mise à jour du Ticket
-        conversation.push({ role: "assistant", content: replyText });
-        fs.writeFileSync(HISTORY_FILE, JSON.stringify(conversation, null, 2));
+        console.log(`✅ [${ticketId}] Réponse reçue : "${replyText.substring(0, 30)}..."`);
+
+        // --- F. SAUVEGARDE DE LA MÉMOIRE ---
         
-        console.log(`✅ [${ticketId}] Terminé !`);
+        // On ajoute la réponse de l'IA à l'historique
+        conversation.push({ role: "assistant", content: replyText });
+        
+        // On écrit le tout dans le fichier JSON sur le serveur
+        try {
+            fs.writeFileSync(HISTORY_FILE, JSON.stringify(conversation, null, 2));
+            console.log("💾 Historique mis à jour sur le disque.");
+        } catch (e) {
+            console.error("⚠️ Impossible de sauvegarder l'historique:", e);
+        }
+
+        // --- G. MISE À JOUR DU TICKET ---
         tasks[ticketId] = { status: "done", result: replyText };
 
     } catch (e) {
         console.error(`❌ [${ticketId}] Erreur OpenAI:`, e);
-        tasks[ticketId] = { status: "error", result: e.message };
+        tasks[ticketId] = { status: "error", result: "Désolé, une erreur s'est produite avec l'IA." };
     }
 }
 
