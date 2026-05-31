@@ -631,7 +631,7 @@ app.post("/chat/start", upload.single("image"), async (req, res) => {
 // ==========================================
 async function processGPTRequest(ticketId, body, file, isNewThread) {
     const userMessage = body.message || body.prompt;
-    const PROMPT_ID = "pmpt_6901002708c0819682d17ea7dddecc5d09ec040d95dda014"; // Ton ID de prompt
+    const PROMPT_ID = "pmpt_691fad11d354819795d31c62d98b409e033ed9b19a0c855d";
 
     // --- A. GESTION DE LA MÉMOIRE (FICHIER JSON) ---
     
@@ -707,8 +707,8 @@ async function processGPTRequest(ticketId, body, file, isNewThread) {
     
     try {
         const response = await openai.responses.create({
-            model: "gpt-5.2", // Ton modèle spécifique
-            prompt: { "id": PROMPT_ID },
+            model: "gpt-5.4", // Ton modèle spécifique
+            prompt: { "id": PROMPT_ID, "version": "2"},
             input: inputsArray,
             store: true // Stockage côté OpenAI
         });
